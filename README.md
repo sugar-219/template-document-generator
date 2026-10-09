@@ -1,0 +1,32 @@
+# 模板文档批量生成软件 v1.9
+
+打开 `桌面版/模板文档批量生成.exe`，点击“载入示例”即可体验。复制或移动时请保留整个桌面版文件夹，`_internal` 是必需的运行依赖。
+
+当前版本采用深绿侧栏、浅色工作区、清晰的统计卡片和分步导航。导航选中标记与生成进度使用短暂平滑过渡，快速切换会取消旧动画并继续到新位置。右上角“界面动画”可随时开启或关闭，选择自动记忆。
+
+支持 Word DOCX 模板、Excel / CSV 数据、字段映射记忆、数据检查及完整报告导出、刷新数据、最近文件、跨页选择、关键词搜索和原始行定位、文档预览、独立批次输出、停止后继续及失败重试。PDF 与真实页面预览需要已安装 Word 或 LibreOffice。
+
+检查报告导出全部问题的源文件、工作表、原始行号和完整说明。修改匹配、命名或范围后须重新检查。数据改动后先保存，再刷新；已开始批次继续使用原来的数据。
+
+## 文件
+
+- `桌面版`：最新版程序、运行依赖、许可、示例及使用说明。
+- `模板文档批量生成软件_v1.9.zip`：相同版本的完整便携包。
+- `src`、`assets`、`requirements*.txt`、`tools`：源码、图标、依赖列表和构建工具。
+- `示例文件`：原始通知模板及 Excel / CSV 示例。
+- `使用说明.md`、`界面预览.png`：操作说明和新版界面。
+
+已移除历史备份、测试文件、验收临时输出和构建缓存。详细操作与限制见使用说明。
+
+## 开发和重建
+
+使用 Windows 与 Python 3.13：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python src/app.py
+powershell -ExecutionPolicy Bypass -File tools/build.ps1
+python tools/package_release.py
+```
+
+普通运行只需安装 requirements.txt。打包工具使用 PyInstaller；运行包已带所需依赖，无需安装 Python 或联网。
