@@ -39,6 +39,14 @@ def resource(name: str) -> Path:
     return Path(getattr(sys, "_MEIPASS", app_directory())) / name
 
 
+def source_stamp(path):
+    try:
+        info = Path(path).stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    except OSError:
+        return None
+
+
 class Application(tk.Tk):
     def __init__(self, settings_path=None):
         super().__init__()
@@ -57,6 +65,9 @@ class Application(tk.Tk):
         self.template = None
         self.dataset = None
         self.data_path = None
+        self.source_stamps = {}
+        self.source_changes = []
+        self.source_notice = tk.StringVar()
         self.mapping = {}
         self.drawing_mapping = False
         self.preferences = Preferences(settings_path)
@@ -121,6 +132,7 @@ class Application(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._poll)
         self.after(30000, self._cleanup_previews)
+        self.after(2000, self._watch_sources)
 
     def _styles(self):
         self.option_add("*Font", (FONT, 9))
@@ -264,6 +276,8 @@ class Application(tk.Tk):
         self.refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, self.px(3)))
         self.recent_button = self._button(file_actions, "最近文件", self.open_recent_files, "Sidebar.TButton")
         self.recent_button.grid(row=0, column=1, sticky="ew", padx=(self.px(3), 0))
+        self.task_button = self._button(sidebar, "任务方案…", self.open_task_profiles, "Sidebar.TButton")
+        self.task_button.pack(fill="x", padx=self.px(16), pady=(self.px(8), 0))
         bottom = tk.Frame(sidebar, bg=SIDE)
         bottom.pack(side="bottom", fill="x", padx=self.px(20), pady=self.px(20))
         self.sidebar_tips = tk.Frame(bottom, bg=SIDE)
@@ -342,10 +356,19 @@ class Application(tk.Tk):
         self._preview_view()
         self._results_view()
 
+        self.source_banner = tk.Frame(main, bg="#FFF3DF")
+        self.source_banner.grid(row=3, column=0, sticky="ew", pady=(self.px(8), 0))
+        self.source_refresh_button = self._button(self.source_banner, "重新读取来源", self.refresh_sources)
+        self.source_refresh_button.pack(side="right", padx=self.px(8), pady=self.px(6))
+        self.source_notice_label = self._label(self.source_banner, size=8, color="#89531F", bg="#FFF3DF",
+                                              textvariable=self.source_notice, justify="left")
+        self.source_notice_label.pack(side="left", fill="x", expand=True, padx=self.px(10), pady=self.px(6))
+        self.source_notice_label.bind("<Configure>", lambda event: self.source_notice_label.configure(wraplength=event.width))
+        self.source_banner.grid_remove()
         self.export_panel, self.pdf_check = self._export_settings(main)
-        self.export_panel.grid(row=3, column=0, sticky="ew", pady=(self.px(14), self.px(12)))
+        self.export_panel.grid(row=4, column=0, sticky="ew", pady=(self.px(14), self.px(12)))
         action = tk.Frame(main, bg=BG)
-        action.grid(row=4, column=0, sticky="ew")
+        action.grid(row=5, column=0, sticky="ew")
         self.generate_button = self._button(action, "生成全部 0 份", self.start_generation, "Accent.TButton")
         self.generate_button.pack(side="right")
         self.cancel_button = ttk.Button(action, text="停止生成", command=self.cancel_event.set, state="disabled", style="Quiet.TButton")
@@ -354,10 +377,10 @@ class Application(tk.Tk):
         self.progress_motion = Motion(self, motion_enabled)
         self.progressbar.pack(side="left", fill="x", expand=True, padx=(0, 16))
         self.action_hint_label = tk.Label(main, textvariable=self.action_hint, bg=BG, fg=GREEN, font=(FONT, 8), anchor="w", justify="left")
-        self.action_hint_label.grid(row=5, column=0, sticky="ew", pady=(self.px(6), 0))
+        self.action_hint_label.grid(row=6, column=0, sticky="ew", pady=(self.px(6), 0))
         self.action_hint_label.bind("<Configure>", lambda event: self.action_hint_label.configure(wraplength=event.width))
         self.status_label = tk.Label(main, textvariable=self.status, bg=BG, fg=MUTED, font=(FONT, 8), anchor="w", justify="left", wraplength=self.px(850))
-        self.status_label.grid(row=6, column=0, sticky="ew", pady=(self.px(4), 0))
+        self.status_label.grid(row=7, column=0, sticky="ew", pady=(self.px(4), 0))
         self.status_label.bind("<Configure>", lambda event: self.status_label.configure(wraplength=event.width))
         self.compact_layout = None
         self.bind("<Configure>", self._resize_layout)
@@ -551,7 +574,7 @@ class Application(tk.Tk):
     def _map_scroll(self, event):
         self.map_canvas.yview_scroll(int(-event.delta / 120), "units")
 
-    def _draw_mapping(self):
+    def _draw_mapping(self, choices=None):
         previous = self._mapping()
         self.drawing_mapping = True
         for widget in self.map_inner.winfo_children():
@@ -573,7 +596,7 @@ class Application(tk.Tk):
         if not isinstance(saved, dict):
             saved = {}
         for row, field in enumerate(self.template.fields, 1):
-            choice = previous.get(field) or saved.get(field) or (field if field in headers else "")
+            choice = choices.get(field, "") if choices is not None else previous.get(field) or saved.get(field) or (field if field in headers else "")
             variable = tk.StringVar(value=choice)
             self.mapping[field] = variable
             self._label(self.map_inner, "{{" + field + "}}", 9, GREEN, bold=True).grid(row=row, column=0, sticky="w", padx=(0, self.px(20)), pady=self.px(8))
@@ -870,13 +893,13 @@ class Application(tk.Tk):
             self.after_cancel(self.save_timer)
         self.save_timer = self.after(500, self._save_preferences)
 
-    def _save_preferences(self, recent_file=None, clear_recent=False):
+    def _save_preferences(self, recent_file=None, clear_recent=False, task_profile=None, delete_task=None):
         self.save_timer = None
         try:
             self.preferences.save(self.output.get(), self.pattern.get(), self.pdf.get(),
                                   self.template.fingerprint if self.template and self.dataset else None,
                                   self._mapping(), recent_file=recent_file, clear_recent=clear_recent,
-                                  animations=self.motion_enabled.get())
+                                  animations=self.motion_enabled.get(), task_profile=task_profile, delete_task=delete_task)
             return True
         except OSError as exc:
             self.status.set("无法保存本地设置：" + str(exc))
@@ -892,7 +915,9 @@ class Application(tk.Tk):
         self.metrics[2].configure(text=f"{matched} / {total}" if total else "—")
         selected_scope = self.scope.get() == "选中记录"
         count = len(self.selected_indices) if selected_scope else len(self.dataset.records) if self.dataset else 0
-        if not self.template:
+        if self.source_changes:
+            input_reason = "源文件已变化或无法读取，请先重新读取来源，再检查和生成。"
+        elif not self.template:
             input_reason = "请先选择 Word 模板，或点击“载入示例”。"
         elif not self.dataset:
             input_reason = "请先选择 Excel / CSV 数据。"
@@ -945,6 +970,13 @@ class Application(tk.Tk):
         window = getattr(self, "recent_window", None)
         if window is not None and window.winfo_exists():
             self._availability(window.open_button, window.file_tree.selection(), "请选择一个最近使用的文件。")
+        window = getattr(self, "tasks_window", None)
+        if window is not None and window.winfo_exists():
+            selected = window.profile_tree.selection()
+            self._availability(window.load_button, selected, "请先选择一个任务方案。")
+            self._availability(window.delete_button, selected, "请先选择要删除的方案。")
+            self._availability(window.save_button, self.template and self.dataset and matched == total and not self.source_changes,
+                               "请先读取模板和数据，完成字段匹配并刷新已变化的来源。")
         self._refresh_filename_preview()
         self._update_activity()
 
@@ -1072,15 +1104,24 @@ class Application(tk.Tk):
             self._open_template(Path(path))
 
     def _open_template(self, path):
-        def read():
-            if not path.is_file():
-                raise InputError("模板文件不存在或已移动，请重新选择：" + str(path))
-            return Template(path)
-        self._run(read, self._template_loaded, "正在读取模板…")
+        self._run(lambda: self._read_template(path), self._template_loaded, "正在读取模板…")
+
+    @staticmethod
+    def _read_template(path):
+        if not path.is_file():
+            raise InputError("模板文件不存在或已移动，请重新选择：" + str(path))
+        stamp = source_stamp(path)
+        template = Template(path)
+        if stamp is None or source_stamp(path) != stamp:
+            raise InputError("读取期间模板文件发生变化，请保存文件后重新读取。")
+        template.source_stamp = stamp
+        return template
 
     def _template_loaded(self, template):
         self._save_preferences()
         self.template = template
+        self.source_stamps["模板"] = (template.path, getattr(template, "source_stamp", source_stamp(template.path)))
+        self._check_source_changes()
         self._show_issues([])
         self.mapping = {}
         self.template_label.configure(text=template.path.name)
@@ -1102,10 +1143,15 @@ class Application(tk.Tk):
     def _read_source(source, sheet=None):
         if not source.is_file():
             raise InputError("数据文件不存在或已移动，请重新选择：" + str(source))
+        stamp = source_stamp(source)
         sheets = sheet_names(source)
         if sheet and sheet not in sheets:
             raise InputError(f"工作表“{sheet}”已不存在，请重新选择数据文件和工作表。")
-        return source, sheets, read_data(source, sheet)
+        dataset = read_data(source, sheet)
+        if stamp is None or source_stamp(source) != stamp:
+            raise InputError("读取期间数据文件发生变化，请保存文件后重新读取。")
+        dataset.source_stamp = stamp
+        return source, sheets, dataset
 
     def _open_data(self, source):
         self._run(lambda: self._read_source(source), self._data_loaded, "正在导入数据…")
@@ -1113,6 +1159,8 @@ class Application(tk.Tk):
     def _data_loaded(self, result):
         path, sheets, dataset = result
         self.data_path, self.dataset = path, dataset
+        self.source_stamps["数据"] = (path, getattr(dataset, "source_stamp", source_stamp(path)))
+        self._check_source_changes()
         self._show_issues([])
         self.data_label.configure(text=path.name)
         self.sheet_combo.configure(values=sheets, state="readonly")
@@ -1149,6 +1197,173 @@ class Application(tk.Tk):
             if saved:
                 self.status.set(f"已刷新 {len(self.dataset.records)} 条记录、{len(headers)} 列，旧选择、搜索和检查已清空。" + note)
         self._run(lambda: self._read_source(source, sheet), refreshed, "正在刷新数据…")
+
+    def _check_source_changes(self):
+        changes = [kind for kind, (path, stamp) in self.source_stamps.items()
+                   if stamp is None or source_stamp(path) != stamp]
+        if changes != self.source_changes:
+            self.source_changes = changes
+            if changes:
+                self._show_issues([])
+            self.source_notice.set("、".join(changes) + "文件已变化或无法读取，请重新读取后检查。" if changes else "")
+            self.source_banner.grid() if changes else self.source_banner.grid_remove()
+            self._refresh_ready()
+        return not changes
+
+    def _watch_sources(self):
+        if not self.busy:
+            self._check_source_changes()
+        self.after(2000, self._watch_sources)
+
+    def _read_inputs(self, template_path, data_path, sheet):
+        template = self._read_template(template_path)
+        data = self._read_source(data_path, sheet)
+        if source_stamp(template_path) != template.source_stamp or source_stamp(data_path) != data[2].source_stamp:
+            raise InputError("读取期间源文件发生变化，请保存后重新读取。")
+        return template, data
+
+    def _apply_inputs(self, result, mapping, pattern):
+        self._template_loaded(result[0])
+        self._data_loaded(result[1])
+        self._draw_mapping(choices=mapping)
+        self.pattern.set(pattern)
+        self._refresh_ready()
+        self._update_preview()
+
+    def refresh_sources(self):
+        if self.busy:
+            return
+        if not self.dataset:
+            if self.template:
+                self._open_template(self.template.path)
+            return
+        if not self.template:
+            self._run(lambda: self._read_source(self.data_path, self.dataset.sheet), self._data_loaded, "正在重新读取数据…")
+            return
+        template_path, data_path, sheet = self.template.path, self.data_path, self.dataset.sheet
+        mapping, pattern = self._mapping(), self.pattern.get()
+        def done(result):
+            self._apply_inputs(result, mapping, pattern)
+            if self._save_preferences():
+                self.status.set("已重新读取模板和数据，匹配与导出设置保留；选择、搜索和旧检查已清空，请重新检查。")
+        self._run(lambda: self._read_inputs(template_path, data_path, sheet), done, "正在重新读取来源…")
+
+    def save_task_profile(self, name):
+        if self.busy or not self.template or not self.dataset or not self._check_source_changes():
+            return False
+        name = name.strip()
+        if not name or len(name) > 80 or any(ord(char) < 32 for char in name):
+            raise InputError("请填写 1 至 80 个字符的方案名称，不含换行或控制字符。")
+        mapping = self._mapping()
+        values = values_for(self.template, mapping, self.dataset.records[0])
+        file_stem(self.pattern.get(), values, 1)
+        if not self.output.get().strip():
+            raise InputError("请先填写输出位置。")
+        profile = {"template": str(self.template.path.resolve()), "data": str(self.data_path.resolve()),
+                   "sheet": self.dataset.sheet, "mapping": mapping, "pattern": self.pattern.get(),
+                   "output": str(Path(self.output.get().strip()).resolve()), "pdf": bool(self.pdf.get()),
+                   "fingerprint": self.template.fingerprint}
+        if self._save_preferences(task_profile=(name, profile)):
+            self.status.set(f"已保存任务方案“{name}”；仅保存路径和设置，不保存业务数据或记录选择。")
+            return True
+        return False
+
+    def load_task_profile(self, name):
+        if self.busy:
+            return
+        profile = self.preferences.task_profiles().get(name)
+        strings = ("template", "data", "sheet", "pattern", "output", "fingerprint")
+        if (not isinstance(profile, dict) or any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in strings)
+                or not isinstance(profile.get("mapping"), dict) or not isinstance(profile.get("pdf"), bool)
+                or any(not isinstance(key, str) or not isinstance(value, str) for key, value in profile["mapping"].items())
+                or any(not Path(profile[key]).is_absolute() for key in ("template", "data", "output"))):
+            raise InputError("任务方案不存在或内容无效，请重新保存。")
+        def done(result):
+            self._apply_inputs(result, profile["mapping"], profile["pattern"])
+            self.output.set(profile["output"])
+            self.pdf.set(profile["pdf"] and bool(self.converter))
+            self.scope.set("全部记录")
+            self.notebook.select(self.mapping_page)
+            note = "模板内容已变化，请核对字段匹配。" if result[0].fingerprint != profile["fingerprint"] else "请核对字段匹配与生成范围。"
+            if profile["pdf"] and not self.converter:
+                note += "未检测到 PDF 转换器，本次已关闭 PDF 导出。"
+            if self._save_preferences():
+                self.status.set(f"已载入方案“{name}”，重新读取 {len(self.dataset.records)} 条记录，生成范围为全部记录。" + note)
+        self._run(lambda: self._read_inputs(Path(profile["template"]), Path(profile["data"]), profile["sheet"]),
+                  done, f"正在载入任务方案“{name}”…")
+
+    def open_task_profiles(self):
+        if self.busy:
+            return None
+        window = getattr(self, "tasks_window", None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            return window
+        window = self.tasks_window = tk.Toplevel(self)
+        window.title("常用任务方案")
+        window.configure(bg=BG)
+        window.transient(self)
+        window.geometry(f"{min(self.px(880), self.winfo_screenwidth()-80)}x{min(self.px(470), self.winfo_screenheight()-100)}")
+        self._label(window, "常用任务方案", 15, bg=BG, bold=True).pack(anchor="w", padx=self.px(18), pady=(self.px(16), self.px(6)))
+        self._label(window, "保存文件路径、工作表、匹配和导出设置；载入时重新读取，范围重置为全部记录。", 9, MUTED, BG,
+                    wraplength=self.px(760)).pack(anchor="w", padx=self.px(18))
+        actions = tk.Frame(window, bg=BG)
+        actions.pack(side="bottom", fill="x", padx=self.px(16), pady=self.px(12))
+        name = tk.StringVar()
+        self._label(actions, "方案名称", 9, bg=BG).grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(actions, textvariable=name)
+        entry.grid(row=0, column=1, columnspan=4, sticky="ew", padx=(self.px(10), 0), pady=(0, self.px(10)))
+        actions.columnconfigure(1, weight=1)
+        def fill():
+            tree.delete(*tree.get_children())
+            for title, profile in self.preferences.task_profiles().items():
+                tree.insert("", "end", iid=title, values=(title, str(profile.get("template", "")),
+                            str(profile.get("data", "")), str(profile.get("sheet", ""))))
+            self._refresh_ready()
+        def perform(action):
+            if self.busy:
+                return
+            try:
+                selected = tree.selection()
+                if action == "save":
+                    title = name.get().strip()
+                    if title in self.preferences.task_profiles() and not messagebox.askyesno("覆盖任务方案", f"更新方案“{title}”的设置？", parent=window):
+                        return
+                    if self.save_task_profile(title):
+                        fill()
+                        tree.selection_set(title)
+                elif selected and action == "load":
+                    self.load_task_profile(selected[0])
+                elif selected and messagebox.askyesno("删除任务方案", "只删除方案设置，不删除源文件或生成结果。继续？", parent=window):
+                    if self._save_preferences(delete_task=selected[0]):
+                        fill()
+                        name.set("")
+                        self.status.set("任务方案已删除，源文件和生成结果保留。")
+            except (InputError, OSError) as exc:
+                messagebox.showerror("任务方案操作未完成", str(exc), parent=window)
+        window.save_button = self._button(actions, "保存当前设置", lambda: perform("save"))
+        window.save_button.grid(row=1, column=0, padx=(0, self.px(8)))
+        window.delete_button = self._button(actions, "删除所选", lambda: perform("delete"))
+        window.delete_button.grid(row=1, column=2, padx=self.px(8))
+        window.load_button = self._button(actions, "载入所选", lambda: perform("load"), "Accent.TButton")
+        window.load_button.grid(row=1, column=3, padx=self.px(8))
+        ttk.Button(actions, text="关闭", command=window.destroy).grid(row=1, column=4)
+        box = tk.Frame(window, bg="white")
+        box.pack(fill="both", expand=True, padx=self.px(16), pady=(self.px(14), 0))
+        tree = window.profile_tree = self._tree(box)
+        tree.configure(columns=("name", "template", "data", "sheet"), selectmode="browse")
+        for column, title, width in (("name", "方案名称", 190), ("template", "模板", 210), ("data", "数据文件", 210), ("sheet", "工作表", 110)):
+            tree.heading(column, text=title, anchor="w")
+            tree.column(column, width=self.px(width), minwidth=self.px(width), stretch=True)
+        def selected(event=None):
+            selection = tree.selection()
+            if selection:
+                name.set(selection[0])
+            self._refresh_ready()
+        tree.bind("<<TreeviewSelect>>", selected)
+        tree.bind("<Double-1>", lambda _: perform("load"))
+        fill()
+        return window
 
     def open_recent_files(self):
         if self.busy:
@@ -1395,8 +1610,12 @@ class Application(tk.Tk):
         if not self.template or not self.dataset:
             self.status.set("请先导入模板和数据并完成字段匹配。")
             return
+        if not self._check_source_changes():
+            return
         template, dataset, mapping, pattern = self.template, self.dataset, self._mapping(), self.pattern.get()
         def done(issues):
+            if not self._check_source_changes():
+                return
             self._show_issues(issues, completed=True)
             self.notebook.select(self.check_page)
             self.status.set("检查完成：错误需要先修正；空值按空白填充，重名文件自动编号。")
@@ -1405,10 +1624,14 @@ class Application(tk.Tk):
     def export_check_report(self):
         if self.busy or not self.issues or not self.data_path:
             return
+        if not self._check_source_changes():
+            return
         path = filedialog.asksaveasfilename(parent=self, title="导出全部检查结果", defaultextension=".csv",
                                           filetypes=[("CSV 检查报告", "*.csv")], initialdir=str(self.data_path.parent),
                                           initialfile="数据检查报告_" + time.strftime("%Y%m%d_%H%M%S") + ".csv")
         if not path:
+            return
+        if not self._check_source_changes():
             return
         destination = Path(path)
         try:
@@ -1431,7 +1654,7 @@ class Application(tk.Tk):
             return
         def load():
             source = folder / "人员数据.xlsx"
-            return Template(folder / "通知模板.docx"), (source, sheet_names(source), read_data(source))
+            return self._read_inputs(folder / "通知模板.docx", source, None)
         def done(result):
             self._template_loaded(result[0])
             self._data_loaded(result[1])
@@ -1526,6 +1749,8 @@ class Application(tk.Tk):
     def start_generation(self):
         if self.busy or not self.dataset:
             return
+        if not self._check_source_changes():
+            return
         mapping = self._mapping()
         template, dataset = self.template, self.dataset
         if not self.output.get().strip():
@@ -1541,6 +1766,8 @@ class Application(tk.Tk):
                 return
         output, pattern, pdf = Path(self.output.get().strip()), self.pattern.get(), self.pdf.get()
         def checked(issues):
+            if not self._check_source_changes():
+                return
             self._show_issues(issues, completed=True)
             if any(issue["级别"] == "错误" for issue in issues):
                 self.notebook.select(self.check_page)
@@ -1682,6 +1909,7 @@ class Application(tk.Tk):
             "2. 准备 Excel 或 CSV\n第一行填写列标题，每行填写一条记录。支持 .xlsx、UTF-8 / GB18030 CSV。编号的前导零应保存为文本或设置为 000 等数字格式。修改后先保存文件，再点击刷新数据；成功刷新清空旧选择、搜索和检查，保留匹配。最近文件可重新打开已用的模板和数据，也可清空路径记录。\n\n"
             "3. 检查匹配和预览\n同名字段自动匹配；手动映射会保留供下次使用。可搜索关键词、定位原始数据行号，跨页保留选择，点击清空全部选择可一次取消。搜索只筛选显示；生成范围仍为全部或选中记录。检查问题可双击定位，或导出全部检查结果为 CSV，包含源行号及完整原因。修改匹配、命名或生成范围后请重新检查。查看排版显示真实页面。\n\n"
             "4. 设置输出并生成\n命名可用 {{序号}} 和模板字段，可先预览前 5 份文件名。主按钮下提示尚缺步骤，灰色操作可悬停查看原因。生成时显示阶段、耗时和剩余时间估算。每次创建独立批次目录和清单。PDF 需要 Word 或 LibreOffice，单份最多等 60 秒。停止后可继续，失败部分可重试。关闭软件后不恢复任务。\n\n"
+            "常用任务与文件变化\n侧栏“任务方案”保存模板/数据路径、工作表、匹配、命名和导出设置，不保存业务数据或记录选择。载入时重新读取源文件，范围重置为全部记录；缺失文件或工作表时保留当前输入。列表路径可右键查看完整内容。源文件保存后发生变化或无法读取时，出现提示栏并阻止新批次生成；点击“重新读取来源”后重新检查。原批次继续和重试保留原数据。\n\n"
             "注意：不支持 .doc / .xls、图片占位符或循环表格；公式数据需要先在 Excel / WPS 中计算并保存。软件保留模板结构，长文本仍可能使文档重新分页。所有数据在本机处理。"
         )
         box = tk.Frame(window, bg="white", highlightbackground=BORDER, highlightthickness=1)
@@ -1801,12 +2029,28 @@ def verify_file_workflow(app, folder):
     assert not Preferences(app.preferences.path).recent_files("template")
     assert source.is_file()
     window.destroy()
+    assert app.save_task_profile("发布验收方案")
+    source.write_text(source.read_text(encoding="utf-8-sig").replace("刷新验收姓名", "方案重新读取姓名"), encoding="utf-8-sig")
+    app._check_source_changes()
+    assert "数据" in app.source_changes and app.generate_button.instate(["disabled"])
+    app.start_generation()
+    assert not app.busy
+    window = app.open_task_profiles()
+    window.profile_tree.selection_set("发布验收方案")
+    app.update()
+    window.load_button.invoke()
+    wait_idle()
+    assert app.dataset.records[0]["姓名"] == "方案重新读取姓名"
+    assert app._mapping()["姓名"] == "部门"
+    assert not app.source_changes and app.scope.get() == "全部记录"
+    window.destroy()
     source = resource("示例文件/人员数据.xlsx")
     app._data_loaded((source, sheet_names(source), read_data(source)))
     app.mapping["姓名"].set("姓名")
     app._save_preferences()
     return {"refresh_reads_saved_file_and_keeps_mapping": True, "refresh_clears_old_selection": True,
-            "recent_template_and_data_reopened": True, "recent_history_cleared_without_deleting_files": True}
+            "recent_template_and_data_reopened": True, "recent_history_cleared_without_deleting_files": True,
+            "changed_source_blocks_new_batch": True, "task_profile_load_reads_current_file_and_keeps_mapping": True}
 
 
 def verify_check_report(app, folder):

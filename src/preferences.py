@@ -36,7 +36,13 @@ class Preferences:
         entries = histories.get(kind, []) if isinstance(histories, dict) else []
         return [path for path in entries if isinstance(path, str) and path][:5] if isinstance(entries, list) else []
 
-    def save(self, output, pattern, pdf, fingerprint=None, mapping=None, recent_file=None, clear_recent=False, animations=None):
+    def task_profiles(self):
+        profiles = self._read().get("task_profiles", {})
+        return {name: copy.deepcopy(profile) for name, profile in profiles.items()
+                if isinstance(name, str) and isinstance(profile, dict)} if isinstance(profiles, dict) else {}
+
+    def save(self, output, pattern, pdf, fingerprint=None, mapping=None, recent_file=None, clear_recent=False, animations=None,
+             task_profile=None, delete_task=None):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         requested = {"output": output, "pattern": pattern, "pdf": bool(pdf)}
         if animations is not None:
@@ -45,6 +51,15 @@ class Preferences:
         missing = object()
         with FileLock(self.path.with_suffix(".lock")):
             data = self._read()
+            if task_profile is not None or delete_task is not None:
+                profiles = data.get("task_profiles", {})
+                profiles = dict(profiles) if isinstance(profiles, dict) else {}
+                if task_profile is not None:
+                    name, profile = task_profile
+                    profiles[name] = copy.deepcopy(profile)
+                if delete_task is not None:
+                    profiles.pop(delete_task, None)
+                data["task_profiles"] = profiles
             if clear_recent:
                 data.pop("recent_files", None)
             elif recent_file:

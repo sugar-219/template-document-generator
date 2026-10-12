@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 release = ROOT / "桌面版"
-archive_path = ROOT / "模板文档批量生成软件_v1.9.zip"
+archive_path = ROOT / "模板文档批量生成软件_v1.10.zip"
 files = sorted(path for path in release.rglob("*") if path.is_file())
 assert (release / "模板文档批量生成.exe").is_file()
 assert (release / "_internal/python313.dll").is_file()
