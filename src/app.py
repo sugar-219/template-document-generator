@@ -22,7 +22,7 @@ from pdf_worker import PdfSession
 from preferences import Preferences
 from preview_cache import PreviewCache
 
-TITLE = "模板文档批量生成"
+TITLE = "模板文档批量"
 BG, INK, MUTED, GREEN, SIDE = "#F5F7F4", "#203B34", "#6B8176", "#187C67", "#173F37"
 BORDER, SOFT = "#DFE7DF", "#EFF4EE"
 SELECT = "#E1F0E5"
