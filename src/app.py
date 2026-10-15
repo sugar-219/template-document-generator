@@ -15,17 +15,20 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from core import InputError, Template, check_records, continue_batch, file_stem, generate_batch, pdf_converter, preview_filenames, read_data, retry_batch, sheet_names, values_for
+from core import CheckCancelled, InputError, Template, check_records, continue_batch, file_stem, generate_batch, pdf_converter, preview_filenames, read_data, retry_batch, sheet_names, values_for
 from check_report import write_check_report
+from batch_state import load_batch_state, save_batch_state, state_token, validate_batch_files
 from motion import Motion
+from local_lock import FileLock
 from pdf_worker import PdfSession
 from preferences import Preferences
 from preview_cache import PreviewCache
+from result_archive import ArchiveCancelled, archive_batch
 
 TITLE = "模板文档批量生成软件"
-BG, INK, MUTED, GREEN, SIDE = "#F5F7F4", "#203B34", "#6B8176", "#187C67", "#173F37"
-BORDER, SOFT = "#DFE7DF", "#EFF4EE"
-SELECT = "#E1F0E5"
+BG, INK, MUTED, GREEN, SIDE = "#F5F6F0", "#21372A", "#667862", "#246B45", "#1D3528"
+BORDER, SOFT = "#DCE4D7", "#EFF3E9"
+SELECT = "#E4EFDE"
 FONT = "Microsoft YaHei UI"
 PAGE_SIZE = 200
 RESULT_COLUMNS = ("数据行", "Word 文件", "PDF 文件", "状态", "说明")
@@ -69,6 +72,7 @@ class Application(tk.Tk):
         self.source_changes = []
         self.source_notice = tk.StringVar()
         self.mapping = {}
+        self.required = {}
         self.drawing_mapping = False
         self.preferences = Preferences(settings_path)
         self.save_timer = None
@@ -135,42 +139,43 @@ class Application(tk.Tk):
         self.after(2000, self._watch_sources)
 
     def _styles(self):
-        self.option_add("*Font", (FONT, 9))
-        self.table_font = tkfont.Font(root=self, font=(FONT, 9))
+        self.option_add("*Font", (FONT, 10))
+        self.table_font = tkfont.Font(root=self, font=(FONT, 10))
         self.metric_font = "Bahnschrift" if "Bahnschrift" in tkfont.families(self) else FONT
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
         style.configure("Card.TFrame", background="white")
         style.configure("TLabel", background=BG, foreground=INK)
-        style.configure("TButton", font=(FONT, 9), width=0, padding=(self.px(13), self.px(6)), background="white", foreground=INK,
-                        bordercolor=BORDER, lightcolor="white", darkcolor="white", borderwidth=1, relief="raised", focusthickness=1, focuscolor=GREEN)
+        style.configure("TButton", font=(FONT, 9), width=0, padding=(self.px(13), self.px(6)), background="#F5F7F2", foreground=INK,
+                        bordercolor=BORDER, lightcolor="#F5F7F2", darkcolor="#F5F7F2", borderwidth=1, relief="flat", focusthickness=1, focuscolor=GREEN)
         style.map("TButton", background=[("disabled", "#F6F8F9"), ("pressed", SELECT), ("active", SOFT)],
-                  foreground=[("disabled", "#8B9AA5")], bordercolor=[("focus", GREEN), ("active", "#A7BFC9")])
+                  foreground=[("disabled", "#8A988C")], bordercolor=[("focus", GREEN), ("active", "#A7BFC9")])
         style.configure("Accent.TButton", background=GREEN, foreground="white", bordercolor=GREEN,
-                        lightcolor=GREEN, darkcolor=GREEN, font=(FONT, 10, "bold"), padding=(self.px(20), self.px(9)))
-        style.map("Accent.TButton", background=[("disabled", "#B5C9CD"), ("pressed", "#0A5F5B"), ("active", "#106E69")],
-                  foreground=[("disabled", "white")], bordercolor=[("disabled", "#B5C9CD"), ("active", "#106E69")])
+                        lightcolor=GREEN, darkcolor=GREEN, font=(FONT, 10, "bold"), padding=(self.px(20), self.px(10)), relief="flat")
+        style.map("Accent.TButton", background=[("disabled", "#DDE8DC"), ("pressed", "#195135"), ("active", "#2D7B55")],
+                  foreground=[("disabled", "#687F65")], bordercolor=[("disabled", "#DDE8DC"), ("active", "#2D7B55")])
         style.configure("Quiet.TButton", background=BG, bordercolor=BG, lightcolor=BG, darkcolor=BG, foreground=MUTED, relief="flat")
-        style.configure("Sidebar.TButton", background="#245449", foreground="#F4FBF5", bordercolor="#356B5E",
-                        lightcolor="#245449", darkcolor="#245449", padding=(self.px(12), self.px(10)), anchor="w")
-        style.map("Sidebar.TButton", background=[("disabled", "#20473E"), ("pressed", "#316B58"), ("active", "#2C6151")],
-                  foreground=[("disabled", "#89A99A")], bordercolor=[("focus", "#B5D9C5"), ("active", "#83AB95")])
-        style.configure("Sidebar.TCombobox", fieldbackground="#245449", foreground="#F4FBF5", background="#245449",
-                        bordercolor="#356B5E", lightcolor="#245449", darkcolor="#245449", arrowcolor="#CAE2D0")
-        style.map("Sidebar.TCombobox", fieldbackground=[("disabled", "#20473E"), ("readonly", "#245449")],
-                  foreground=[("disabled", "#89A99A"), ("readonly", "#F4FBF5")], bordercolor=[("focus", "#B5D9C5")])
+        style.configure("Compact.TButton", padding=(self.px(10), self.px(4)))
+        style.configure("Sidebar.TButton", background="#284A3A", foreground="#EDF4EB", bordercolor="#3E5F4C",
+                        lightcolor="#284A3A", darkcolor="#284A3A", padding=(self.px(12), self.px(10)), anchor="w")
+        style.map("Sidebar.TButton", background=[("disabled", "#213D31"), ("pressed", "#365E48"), ("active", "#315740")],
+                  foreground=[("disabled", "#829A87")], bordercolor=[("focus", "#D1E3CC"), ("active", "#87AA8C")])
+        style.configure("Sidebar.TCombobox", fieldbackground="#284A3A", foreground="#EDF4EB", background="#284A3A",
+                        bordercolor="#3E5F4C", lightcolor="#284A3A", darkcolor="#284A3A", arrowcolor="#CDDDC8")
+        style.map("Sidebar.TCombobox", fieldbackground=[("disabled", "#213D31"), ("readonly", "#284A3A")],
+                  foreground=[("disabled", "#829A87"), ("readonly", "#EDF4EB")], bordercolor=[("focus", "#D1E3CC")])
         for name in ("TEntry", "TCombobox", "TSpinbox"):
-            style.configure(name, padding=self.px(5), fieldbackground="white", foreground=INK, background=SOFT, arrowcolor=MUTED, bordercolor=BORDER,
+            style.configure(name, padding=self.px(4), fieldbackground="white", foreground=INK, background=SOFT, arrowcolor=MUTED, bordercolor=BORDER,
                             lightcolor="white", darkcolor="white", arrowsize=self.px(12))
             style.map(name, bordercolor=[("focus", GREEN)], fieldbackground=[("disabled", BG), ("readonly", "white")],
-                      foreground=[("disabled", "#8B9AA5"), ("readonly", INK)])
-        style.configure("Treeview", font=(FONT, 9), rowheight=self.px(34), background="white", fieldbackground="white", foreground=INK,
+                      foreground=[("disabled", "#8A988C"), ("readonly", INK)])
+        style.configure("Treeview", font=(FONT, 10), rowheight=self.px(36), background="white", fieldbackground="white", foreground=INK,
                         bordercolor=BORDER, lightcolor="white", darkcolor="white", borderwidth=0)
         style.configure("Treeview.Heading", font=(FONT, 9, "bold"), padding=(self.px(10), self.px(9)), background=SOFT,
-                        foreground="#486577", bordercolor=SOFT, lightcolor=SOFT, darkcolor=SOFT, relief="flat")
-        style.map("Treeview.Heading", background=[("active", "#E1EBF0")])
-        style.map("Treeview", background=[("selected", SELECT)], foreground=[("selected", "#105B57")])
+                        foreground="#667862", bordercolor=SOFT, lightcolor=SOFT, darkcolor=SOFT, relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#E6EEE1")])
+        style.map("Treeview", background=[("selected", SELECT)], foreground=[("selected", "#214A32")])
         style.configure("TNotebook", background=BG, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, borderwidth=1, tabmargins=(0, 0, 0, 0))
         style.configure("TNotebook.Tab", font=(FONT, 9, "bold"), padding=(self.px(18), self.px(10)), background=BG,
                         foreground=MUTED, bordercolor=BG, lightcolor=BG, darkcolor=BG, focuscolor=GREEN)
@@ -179,21 +184,40 @@ class Application(tk.Tk):
         style.layout("Workspace.TNotebook.Tab", [])
         for name, background, foreground in (("Navigation.TButton", BG, MUTED), ("ActiveNavigation.TButton", "white", GREEN)):
             style.configure(name, background=background, foreground=foreground, bordercolor=background, lightcolor=background,
-                            darkcolor=background, borderwidth=0, relief="flat", font=(FONT, 9, "bold"), padding=(self.px(12), self.px(8)))
+                            darkcolor=background, borderwidth=0, relief="flat", font=(FONT, 10, "bold"), padding=(self.px(10), self.px(9)))
             style.map(name, background=[("pressed", SELECT), ("active", SOFT)], bordercolor=[("focus", GREEN)])
-        style.configure("Horizontal.TProgressbar", background=GREEN, troughcolor="#DFE8EC", bordercolor="#DFE8EC", lightcolor=GREEN, darkcolor=GREEN, borderwidth=0, thickness=self.px(5))
+        style.configure("Horizontal.TProgressbar", background=GREEN, troughcolor="#E9EEE5", bordercolor="#E9EEE5", lightcolor=GREEN, darkcolor=GREEN, borderwidth=0, thickness=self.px(5))
         for name in ("TCheckbutton", "TRadiobutton"):
             style.configure(name, font=(FONT, 9), background="white", foreground=INK, indicatorbackground="white", indicatorforeground=GREEN, focuscolor=GREEN)
-            style.map(name, background=[("active", "white")], foreground=[("disabled", "#8B9AA5")])
+            style.map(name, background=[("active", "white")], foreground=[("disabled", "#8A988C")])
+        self.check_images = []
+        size = self.px(16)
+        for selected, disabled in ((False, False), (True, False), (False, True), (True, True)):
+            picture = tk.PhotoImage(master=self, width=size, height=size)
+            border = "#CAD5C6" if disabled else GREEN if selected else "#AFBFAB"
+            fill = "#DAE4D6" if disabled and selected else GREEN if selected else "white"
+            picture.put(fill, to=(1, 1, size-1, size-1))
+            for rectangle in ((1, 0, size-1, 1), (1, size-1, size-1, size), (0, 1, 1, size-1), (size-1, 1, size, size-1)):
+                picture.put(border, to=rectangle)
+            if selected:
+                for x, y in ((4, 8), (5, 9), (6, 10), (7, 9), (8, 8), (9, 7), (10, 6), (11, 5)):
+                    picture.put("#7C9176" if disabled else "white", to=(self.px(x), self.px(y), self.px(x+2), self.px(y+2)))
+            self.check_images.append(picture)
+        style.element_create("Paper.CheckIndicator", "image", self.check_images[0],
+                             ("disabled", "selected", self.check_images[3]), ("disabled", self.check_images[2]),
+                             ("selected", self.check_images[1]), sticky="w", padding=(0, 0, self.px(5), 0))
+        style.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Paper.CheckIndicator", {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "nswe", "children": [("Checkbutton.label", {"sticky": "nswe"})]})]})])
         style.configure("Header.TCheckbutton", background=BG, foreground=MUTED)
         style.map("Header.TCheckbutton", background=[("active", BG)])
         for orientation, sticky in (("Vertical", "ns"), ("Horizontal", "ew")):
             name = orientation + ".TScrollbar"
             style.layout(name, [(orientation + ".Scrollbar.trough", {"sticky": sticky, "children": [
                 (orientation + ".Scrollbar.thumb", {"expand": 1, "sticky": "nsew"})]})])
-            style.configure(name, background="#C4D3DC", troughcolor="#F3F6F8", bordercolor="#F3F6F8",
-                            lightcolor="#C4D3DC", darkcolor="#C4D3DC", borderwidth=0, width=self.px(9))
-            style.map(name, background=[("active", "#9AB4C3"), ("pressed", "#7596A8")])
+            style.configure(name, background="#CCD7C9", troughcolor="#F5F7F2", bordercolor="#F5F7F2",
+                            lightcolor="#CCD7C9", darkcolor="#CCD7C9", borderwidth=0, width=self.px(9))
+            style.map(name, background=[("active", "#AFBFA9"), ("pressed", "#8BA485")])
 
     def _button(self, parent, text, command, style="TButton"):
         widget = ttk.Button(parent, text=text, command=command, style=style)
@@ -237,7 +261,7 @@ class Application(tk.Tk):
         return tk.Label(parent, text=text, font=(FONT, size, "bold" if bold else "normal"), fg=color, bg=bg, anchor="w", **kwargs)
 
     def _build(self):
-        sidebar = tk.Frame(self, bg=SIDE, width=self.px(218))
+        sidebar = tk.Frame(self, bg=SIDE, width=self.px(224))
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
         brand = tk.Frame(sidebar, bg=SIDE)
@@ -246,25 +270,25 @@ class Application(tk.Tk):
         mark = tk.Canvas(brand, width=self.px(32), height=self.px(36), bg=SIDE, highlightthickness=0)
         self.brand_mark = mark
         mark.pack(side="left", padx=(0, self.px(12)))
-        mark.create_polygon(*[self.px(value) for value in (3, 2, 21, 2, 29, 10, 29, 33, 3, 33)], outline="#83C8BC", fill=SIDE, width=self.px(1))
-        mark.create_line(*[self.px(value) for value in (21, 2, 21, 10, 29, 10)], fill="#83C8BC", width=self.px(1))
+        mark.create_polygon(*[self.px(value) for value in (3, 2, 21, 2, 29, 10, 29, 33, 3, 33)], outline="#ACCAAD", fill=SIDE, width=self.px(1))
+        mark.create_line(*[self.px(value) for value in (21, 2, 21, 10, 29, 10)], fill="#ACCAAD", width=self.px(1))
         for line in (16, 22, 28):
-            mark.create_line(self.px(9), self.px(line), self.px(22 if line != 28 else 17), self.px(line), fill="#83C8BC", width=self.px(1))
+            mark.create_line(self.px(9), self.px(line), self.px(22 if line != 28 else 17), self.px(line), fill="#ACCAAD", width=self.px(1))
         self.brand_text = tk.Frame(brand, bg=SIDE)
         self.brand_text.pack(side="left")
-        self.brand_title = self._label(self.brand_text, "模板文档", 16, "#F0F7FA", SIDE, True)
+        self.brand_title = self._label(self.brand_text, "模板文档", 17, "#F3F5EA", SIDE, True)
         self.brand_title.pack(anchor="w")
-        self.brand_subtitle = self._label(self.brand_text, "批量生成工作台", 8, "#9BB4C2", SIDE)
+        self.brand_subtitle = self._label(self.brand_text, "批量生成工作台", 9, "#9FB39F", SIDE)
         self.brand_subtitle.pack(anchor="w", pady=(self.px(5), 0))
-        tk.Frame(sidebar, bg="#304957", height=1).pack(fill="x", padx=self.px(20), pady=(0, self.px(20)))
-        self._label(sidebar, "文件来源", 8, "#9BB4C2", SIDE).pack(anchor="w", padx=self.px(20))
+        tk.Frame(sidebar, bg="#355343", height=1).pack(fill="x", padx=self.px(20), pady=(0, self.px(20)))
+        self._label(sidebar, "文件来源", 8, "#9FB39F", SIDE).pack(anchor="w", padx=self.px(20))
         self._button(sidebar, "01   选择 Word 模板", self.choose_template, "Sidebar.TButton").pack(fill="x", padx=self.px(16), pady=(self.px(10), self.px(7)))
-        self.template_label = self._label(sidebar, "尚未选择 .docx", 8, "#BACED8", SIDE, wraplength=self.px(178))
+        self.template_label = self._label(sidebar, "尚未选择 .docx", 9, "#C8D6C4", SIDE, wraplength=self.px(184))
         self.template_label.pack(fill="x", padx=self.px(20), pady=(0, self.px(20)))
         self._button(sidebar, "02   选择 Excel / CSV", self.choose_data, "Sidebar.TButton").pack(fill="x", padx=self.px(16), pady=(0, self.px(7)))
-        self.data_label = self._label(sidebar, "尚未选择数据", 8, "#BACED8", SIDE, wraplength=self.px(178))
+        self.data_label = self._label(sidebar, "尚未选择数据", 9, "#C8D6C4", SIDE, wraplength=self.px(184))
         self.data_label.pack(fill="x", padx=self.px(20), pady=(0, self.px(16)))
-        self._label(sidebar, "工作表", 8, "#9BB4C2", SIDE).pack(anchor="w", padx=self.px(20), pady=(0, self.px(6)))
+        self._label(sidebar, "工作表", 8, "#9FB39F", SIDE).pack(anchor="w", padx=self.px(20), pady=(0, self.px(6)))
         self.sheet_combo = ttk.Combobox(sidebar, textvariable=self.sheet, state="disabled", style="Sidebar.TCombobox")
         self.sheet_combo.pack(fill="x", padx=self.px(16))
         self.sheet_combo.bind("<<ComboboxSelected>>", lambda _: self.reload_sheet())
@@ -282,10 +306,10 @@ class Application(tk.Tk):
         bottom.pack(side="bottom", fill="x", padx=self.px(20), pady=self.px(20))
         self.sidebar_tips = tk.Frame(bottom, bg=SIDE)
         self.sidebar_tips.pack(fill="x")
-        tk.Frame(self.sidebar_tips, bg="#304957", height=1).pack(fill="x", pady=(0, self.px(14)))
-        self._label(self.sidebar_tips, "占位符写法", 8, "#9BB4C2", SIDE).pack(anchor="w")
-        self._label(self.sidebar_tips, "{{姓名}}  {{部门}}", 10, "#83C8BC", SIDE).pack(anchor="w", pady=(self.px(6), self.px(8)))
-        self._label(self.sidebar_tips, "数据首行为列标题\n一行数据生成一份文档", 8, "#BACED8", SIDE, justify="left").pack(anchor="w")
+        tk.Frame(self.sidebar_tips, bg="#355343", height=1).pack(fill="x", pady=(0, self.px(14)))
+        self._label(self.sidebar_tips, "占位符写法", 8, "#9FB39F", SIDE).pack(anchor="w")
+        self._label(self.sidebar_tips, "{{姓名}}  {{部门}}", 10, "#ACCAAD", SIDE).pack(anchor="w", pady=(self.px(6), self.px(8)))
+        self._label(self.sidebar_tips, "数据首行为列标题\n一行数据生成一份文档", 8, "#C8D6C4", SIDE, justify="left").pack(anchor="w")
         self._button(bottom, "使用说明", self.show_help, "Sidebar.TButton").pack(fill="x", pady=(self.px(14), 0))
 
         main = tk.Frame(self, bg=BG)
@@ -295,31 +319,31 @@ class Application(tk.Tk):
         main.rowconfigure(2, weight=1)
         header = tk.Frame(main, bg=BG)
         self.header = header
-        header.grid(row=0, column=0, sticky="ew", pady=(0, self.px(18)))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, self.px(12)))
         self.demo_button = self._button(header, "载入示例", self.load_demo)
         self.demo_button.pack(side="right", padx=(10, 0))
         self.motion_check = ttk.Checkbutton(header, text="界面动画", variable=self.motion_enabled, style="Header.TCheckbutton")
         self.motion_check.pack(side="right", padx=(self.px(12), 0))
         self.compact_export_button = self._button(header, "导出设置…", self.open_export_settings)
-        self._label(header, "批量文档工作台", 21, bg=BG, bold=True).pack(anchor="w")
-        self.header_subtitle = self._label(header, "准备一份模板，让每一行数据都有自己的文档。", 9, MUTED, BG)
+        self.header_title = self._label(header, "批量文档工作台", 24, bg=BG, bold=True)
+        self.header_title.pack(anchor="w")
+        self.header_subtitle = self._label(header, "选择模板与数据，匹配字段后即可生成。", 9, MUTED, BG)
         self.header_subtitle.pack(anchor="w", pady=(self.px(5), 0))
         cards = tk.Frame(main, bg=BG)
         self.cards = cards
-        cards.grid(row=1, column=0, sticky="ew", pady=(0, self.px(16)))
+        cards.grid(row=1, column=0, sticky="ew", pady=(0, self.px(12)))
         self.metrics = []
         for index, title in enumerate(("模板字段", "数据记录", "字段匹配")):
             cards.columnconfigure(index, weight=1, uniform="metrics")
             card_bg = SELECT if index == 2 else "white"
-            card = tk.Frame(cards, bg=card_bg, highlightbackground="#C2DED9" if index == 2 else BORDER, highlightthickness=1)
+            card = tk.Frame(cards, bg=card_bg, highlightbackground="#CADBC8" if index == 2 else BORDER, highlightthickness=1)
             card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else self.px(10), 0))
-            tk.Frame(card, bg=GREEN if index == 2 else "#ABC4B4", width=self.px(3)).pack(side="left", fill="y")
             content = tk.Frame(card, bg=card_bg)
             content.pack(fill="both", expand=True)
-            self._label(content, title, 8, MUTED, card_bg).pack(anchor="w", padx=self.px(16), pady=(self.px(8), 0))
             number = self._label(content, "—", 22, GREEN if index == 2 else INK, card_bg, bold=True)
             number.configure(font=(self.metric_font, 22, "bold"))
-            number.pack(anchor="w", padx=self.px(16), pady=(self.px(2), self.px(5)))
+            number.pack(side="left", padx=(self.px(18), self.px(12)), pady=self.px(9))
+            self._label(content, title, 9, MUTED, card_bg).pack(side="left", pady=self.px(9))
             self.metrics.append(number)
 
         workspace = tk.Frame(main, bg=BG)
@@ -329,7 +353,7 @@ class Application(tk.Tk):
         self.navigation = tk.Frame(workspace, bg=BG)
         self.navigation.grid(row=0, column=0, sticky="ew")
         self.notebook = ttk.Notebook(workspace, height=self.px(150), style="Workspace.TNotebook")
-        self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.notebook.grid(row=1, column=0, sticky="nsew", pady=(self.px(6), 0))
         self.mapping_page = ttk.Frame(self.notebook, style="Card.TFrame")
         self.data_page = ttk.Frame(self.notebook, style="Card.TFrame")
         self.check_page = ttk.Frame(self.notebook, style="Card.TFrame")
@@ -342,9 +366,9 @@ class Application(tk.Tk):
             button = ttk.Button(self.navigation, text=f"0{index+1}  {name}", command=lambda page=frame: self.notebook.select(page), style="Navigation.TButton")
             button.grid(row=0, column=index, sticky="ew")
             self.nav_buttons.append(button)
-        self.nav_line = tk.Canvas(self.navigation, height=self.px(3), bg=BG, highlightthickness=0)
+        self.nav_line = tk.Canvas(self.navigation, height=self.px(2), bg=BG, highlightthickness=0)
         self.nav_line.grid(row=1, column=0, columnspan=5, sticky="ew")
-        self.nav_indicator = self.nav_line.create_rectangle(0, 0, 0, self.px(3), fill=GREEN, outline="")
+        self.nav_indicator = self.nav_line.create_rectangle(0, 0, 0, self.px(2), fill=GREEN, outline="")
         motion_enabled = self.motion_enabled.get()
         self.nav_motion = Motion(self, motion_enabled)
         self.nav_line.bind("<Configure>", lambda _: self.after_idle(lambda: self._sync_navigation(animate=False)))
@@ -358,20 +382,21 @@ class Application(tk.Tk):
 
         self.source_banner = tk.Frame(main, bg="#FFF3DF")
         self.source_banner.grid(row=3, column=0, sticky="ew", pady=(self.px(8), 0))
-        self.source_refresh_button = self._button(self.source_banner, "重新读取来源", self.refresh_sources)
-        self.source_refresh_button.pack(side="right", padx=self.px(8), pady=self.px(6))
+        self.source_refresh_button = self._button(self.source_banner, "重新读取来源", self.refresh_sources, "Compact.TButton")
+        self.source_refresh_button.pack(side="right", padx=self.px(8), pady=self.px(4))
         self.source_notice_label = self._label(self.source_banner, size=8, color="#89531F", bg="#FFF3DF",
                                               textvariable=self.source_notice, justify="left")
         self.source_notice_label.pack(side="left", fill="x", expand=True, padx=self.px(10), pady=self.px(6))
         self.source_notice_label.bind("<Configure>", lambda event: self.source_notice_label.configure(wraplength=event.width))
         self.source_banner.grid_remove()
         self.export_panel, self.pdf_check = self._export_settings(main)
-        self.export_panel.grid(row=4, column=0, sticky="ew", pady=(self.px(14), self.px(12)))
-        action = tk.Frame(main, bg=BG)
+        self.export_panel.grid(row=4, column=0, sticky="ew", pady=(self.px(10), self.px(8)))
+        action = tk.Frame(main, bg="white", highlightbackground=BORDER, highlightthickness=1, padx=self.px(14), pady=self.px(6))
+        self.action_bar = action
         action.grid(row=5, column=0, sticky="ew")
         self.generate_button = self._button(action, "生成全部 0 份", self.start_generation, "Accent.TButton")
         self.generate_button.pack(side="right")
-        self.cancel_button = ttk.Button(action, text="停止生成", command=self.cancel_event.set, state="disabled", style="Quiet.TButton")
+        self.cancel_button = ttk.Button(action, text="停止生成", command=self.cancel_event.set, state="disabled")
         self.cancel_button.pack(side="right", padx=10)
         self.progressbar = ttk.Progressbar(action, mode="determinate", length=130)
         self.progress_motion = Motion(self, motion_enabled)
@@ -389,6 +414,10 @@ class Application(tk.Tk):
 
     def _sync_navigation(self, animate=True):
         selected = self.notebook.index(self.notebook.select())
+        if selected == 4 or getattr(self, "compact_layout", False):
+            self.cards.grid_remove()
+        else:
+            self.cards.grid()
         for index, button in enumerate(self.nav_buttons):
             button.configure(style="ActiveNavigation.TButton" if index == selected else "Navigation.TButton")
         button = self.nav_buttons[selected]
@@ -396,9 +425,9 @@ class Application(tk.Tk):
         coordinates = self.nav_line.coords(self.nav_indicator)
         origin = (coordinates[0], coordinates[2])
         def draw(position):
-            self.nav_line.coords(self.nav_indicator, position[0], 0, position[1], self.px(3))
+            self.nav_line.coords(self.nav_indicator, position[0], 0, position[1], self.px(2))
         if animate and self.nav_line.winfo_ismapped():
-            self.nav_motion.start(origin, destination, draw)
+            self.nav_motion.start(origin, destination, draw, duration=240)
         else:
             self.nav_motion.cancel()
             draw(destination)
@@ -419,28 +448,28 @@ class Application(tk.Tk):
         self.controls = [(widget, state) for widget, state in self.controls if widget.winfo_exists()]
         settings = tk.Frame(parent, bg="white", highlightthickness=1, highlightbackground=BORDER)
         settings.columnconfigure(1, weight=1)
-        self._label(settings, "文件命名", 9).grid(row=0, column=0, padx=(self.px(14), self.px(10)), pady=(self.px(10), self.px(4)))
+        self._label(settings, "文件命名", 9).grid(row=0, column=0, padx=(self.px(14), self.px(10)), pady=(self.px(6), self.px(3)))
         naming = ttk.Entry(settings, textvariable=self.pattern)
-        naming.grid(row=0, column=1, sticky="ew", pady=(self.px(10), self.px(4)))
+        naming.grid(row=0, column=1, sticky="ew", pady=(self.px(6), self.px(3)))
         self.controls.append((naming, "normal"))
         pdf_check = ttk.Checkbutton(settings, text="同时导出 PDF", variable=self.pdf, state="normal" if self.converter else "disabled")
-        pdf_check.grid(row=0, column=2, padx=self.px(14), pady=(self.px(10), self.px(4)))
+        pdf_check.grid(row=0, column=2, padx=self.px(14), pady=(self.px(6), self.px(3)))
         self.controls.append((pdf_check, "normal" if self.converter else "disabled"))
         self._bind_disabled_reason(pdf_check)
         self.pdf_checks = [widget for widget in self.pdf_checks if widget.winfo_exists()]
         self.pdf_checks.append(pdf_check)
         preview = self._button(settings, "预览文件名", self.show_filename_preview)
-        preview.grid(row=0, column=3, padx=(0, self.px(14)), pady=(self.px(10), self.px(4)))
+        preview.grid(row=0, column=3, padx=(0, self.px(14)), pady=(self.px(6), self.px(3)))
         self.naming_buttons = [widget for widget in self.naming_buttons if widget.winfo_exists()]
         self.naming_buttons.append(preview)
-        self._label(settings, "输出位置", 9).grid(row=1, column=0, padx=(self.px(14), self.px(10)), pady=self.px(4))
+        self._label(settings, "输出位置", 9).grid(row=1, column=0, padx=(self.px(14), self.px(10)), pady=self.px(3))
         out = ttk.Entry(settings, textvariable=self.output)
-        out.grid(row=1, column=1, sticky="ew", pady=self.px(4))
+        out.grid(row=1, column=1, sticky="ew", pady=self.px(3))
         self.controls.append((out, "normal"))
-        self._button(settings, "选择文件夹", self.choose_output).grid(row=1, column=2, columnspan=2, padx=self.px(14), pady=self.px(4), sticky="ew")
+        self._button(settings, "选择文件夹", self.choose_output).grid(row=1, column=2, columnspan=2, padx=self.px(14), pady=self.px(3), sticky="ew")
         converter_text = f"PDF：{self.converter[0]} 已检测到" if self.converter else "PDF：需安装 Word 或 LibreOffice"
-        self._label(settings, "支持 {{序号}} 和模板字段；每次创建独立批次目录。", 8, MUTED).grid(row=2, column=0, columnspan=2, sticky="w", padx=self.px(14), pady=(self.px(3), self.px(10)))
-        self._label(settings, converter_text, 8, MUTED).grid(row=2, column=2, columnspan=2, padx=self.px(14), pady=(self.px(3), self.px(10)), sticky="w")
+        self._label(settings, "支持 {{序号}} 和模板字段；每次创建独立批次目录。", 8, MUTED).grid(row=2, column=0, columnspan=2, sticky="w", padx=self.px(14), pady=(self.px(3), self.px(8)))
+        self._label(settings, converter_text, 8, MUTED).grid(row=2, column=2, columnspan=2, padx=self.px(14), pady=(self.px(3), self.px(8)), sticky="w")
         return settings, pdf_check
 
     def _resize_layout(self, event=None):
@@ -451,8 +480,10 @@ class Application(tk.Tk):
         if compact == self.compact_layout:
             return
         self.compact_layout = compact
-        self.main.pack_configure(pady=self.px(12 if compact else 22))
-        self.header.grid_configure(pady=(0, self.px(10 if compact else 18)))
+        self.main.pack_configure(pady=self.px(10 if compact else 22))
+        self.header_title.configure(font=(FONT, 20 if compact else 24, "bold"))
+        self.action_bar.configure(pady=self.px(4 if compact else 6))
+        self.header.grid_configure(pady=(0, self.px(10 if compact else 12)))
         self.brand.pack_configure(pady=(self.px(18 if compact else 26), self.px(18 if compact else 28)))
         if compact:
             self.cards.grid_remove()
@@ -463,7 +494,8 @@ class Application(tk.Tk):
             self.sidebar_tips.pack_forget()
             self.compact_export_button.pack(side="right", before=self.demo_button, padx=(10, 0))
         else:
-            self.cards.grid()
+            if self.notebook.select() != str(self.result_page):
+                self.cards.grid()
             self.export_panel.grid()
             self.header_subtitle.pack(anchor="w", pady=(self.px(5), 0))
             self.brand_mark.pack(side="left", before=self.brand_text, padx=(0, self.px(12)))
@@ -553,9 +585,9 @@ class Application(tk.Tk):
 
     def _mapping_view(self):
         bar = tk.Frame(self.mapping_page, bg="white")
-        bar.pack(fill="x", padx=self.px(16), pady=(self.px(12), self.px(8)))
+        bar.pack(fill="x", padx=self.px(16), pady=(self.px(10), self.px(6)))
         self._button(bar, "检查数据", self.check_data).pack(side="right")
-        self._label(bar, "同名字段自动匹配；手动匹配会保存供下次使用。", 9, MUTED).pack(side="left")
+        self._label(bar, "同名字段自动匹配；勾选必填后，空值将阻止生成。", 9, MUTED).pack(side="left")
         container = tk.Frame(self.mapping_page, bg="white")
         container.pack(fill="both", expand=True, padx=self.px(16), pady=(0, self.px(14)))
         self.map_canvas = tk.Canvas(container, bg="white", borderwidth=0, highlightthickness=0)
@@ -576,37 +608,56 @@ class Application(tk.Tk):
 
     def _draw_mapping(self, choices=None):
         previous = self._mapping()
+        previous_required = self._required_fields()
+        had_rules = bool(self.required)
         self.drawing_mapping = True
         for widget in self.map_inner.winfo_children():
             widget.destroy()
         self.controls = [(w, state) for w, state in self.controls if w.winfo_exists()]
         self.mapping = {}
+        self.required = {}
         if not self.template:
-            self._label(self.map_inner, "从一份 Word 模板开始", 15, INK, bold=True).pack(anchor="w", pady=(self.px(28), self.px(10)))
+            icon = tk.Canvas(self.map_inner, width=self.px(48), height=self.px(56), bg="white", highlightthickness=0)
+            icon.pack(anchor="w", pady=(self.px(24), self.px(16)))
+            icon.create_polygon(*[self.px(value) for value in (4, 2, 30, 2, 44, 16, 44, 52, 4, 52)],
+                                fill=SOFT, outline=BORDER, width=1)
+            icon.create_line(*[self.px(value) for value in (30, 2, 30, 16, 44, 16)], fill=GREEN)
+            for line in (25, 33, 41):
+                icon.create_line(self.px(13), self.px(line), self.px(34 if line != 41 else 26), self.px(line), fill=GREEN)
+            self._label(self.map_inner, "从一份 Word 模板开始", 18, INK, bold=True).pack(anchor="w", pady=(0, self.px(10)))
             self._label(self.map_inner, "在 Word 中写入 {{字段名}}，再选择保存后的 .docx 文件。", 9, MUTED, wraplength=self.px(520)).pack(anchor="w")
             self._label(self.map_inner, "也可以点击右上角“载入示例”，体验字段匹配与批量生成。", 9, MUTED, wraplength=self.px(520)).pack(anchor="w", pady=(self.px(7), 0))
             self.drawing_mapping = False
             return
-        for column, heading in enumerate(("模板字段", "对应数据列", "首条记录")):
-            self._label(self.map_inner, heading, 9, "#486577", bg=SOFT, bold=True).grid(row=0, column=column, sticky="ew", ipady=self.px(8), padx=(0, self.px(12)))
+        for column, heading in enumerate(("模板字段", "对应数据列", "首条记录", "必填")):
+            self._label(self.map_inner, heading, 9, MUTED, bg=SOFT, bold=True, padx=self.px(8)).grid(row=0, column=column, sticky="ew", ipady=self.px(8))
         self.map_inner.columnconfigure(1, weight=1)
         self.map_inner.columnconfigure(2, weight=1)
         headers = self.dataset.headers if self.dataset else []
         saved = self.preferences.profile(self.template.fingerprint).get("mapping", {})
         if not isinstance(saved, dict):
             saved = {}
+        saved_required = self.preferences.profile(self.template.fingerprint).get("required_fields", [])
+        if not isinstance(saved_required, list):
+            saved_required = []
+        required = set(previous_required) if had_rules else set(saved_required)
         for row, field in enumerate(self.template.fields, 1):
             choice = choices.get(field, "") if choices is not None else previous.get(field) or saved.get(field) or (field if field in headers else "")
             variable = tk.StringVar(value=choice)
             self.mapping[field] = variable
-            self._label(self.map_inner, "{{" + field + "}}", 9, GREEN, bold=True).grid(row=row, column=0, sticky="w", padx=(0, self.px(20)), pady=self.px(8))
+            self._label(self.map_inner, "{{" + field + "}}", 9, GREEN, bold=True, wraplength=self.px(160), justify="left").grid(row=row, column=0, sticky="w", padx=(self.px(8), self.px(20)), pady=self.px(2))
             combo = ttk.Combobox(self.map_inner, textvariable=variable, values=["", *headers], state="readonly", width=19)
-            combo.grid(row=row, column=1, sticky="ew", padx=(0, self.px(16)), pady=self.px(7))
+            combo.grid(row=row, column=1, sticky="ew", padx=(self.px(8), self.px(16)), pady=self.px(2))
             self.controls.append((combo, "readonly"))
             sample = self._label(self.map_inner, "", 9, MUTED, wraplength=self.px(220))
-            sample.grid(row=row, column=2, sticky="w", pady=self.px(7))
+            sample.grid(row=row, column=2, sticky="w", padx=(self.px(8), 0), pady=self.px(2))
             variable.trace_add("write", lambda *args, value=variable, label=sample: self._mapping_changed(value, label))
             self._mapping_changed(variable, sample)
+            rule = self.required[field] = tk.BooleanVar(value=field in required)
+            required_check = ttk.Checkbutton(self.map_inner, variable=rule)
+            required_check.grid(row=row, column=3, padx=self.px(8), pady=self.px(2))
+            self.controls.append((required_check, "normal"))
+            rule.trace_add("write", lambda *args: self._required_changed())
         self.drawing_mapping = False
         self._refresh_ready()
         self._update_preview()
@@ -636,7 +687,7 @@ class Application(tk.Tk):
         horizontal = ttk.Scrollbar(box, orient="horizontal", command=tree.xview)
         horizontal.grid(row=1, column=0, sticky="ew")
         tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        tree.tag_configure("odd", background="#F7F9FB")
+        tree.tag_configure("odd", background="#F8FAF5")
         tree.cell_menu = tk.Menu(tree, tearoff=False)
         tree.bind("<Button-3>", lambda event: self._cell_menu(tree, event))
         tree.bind("<Configure>", lambda _: self._fit_table(tree))
@@ -782,6 +833,8 @@ class Application(tk.Tk):
             self.check_tree.heading(column, text=column, anchor="w")
             self.check_tree.column(column, width=self.px(300 if column == "说明" else 100),
                                    minwidth=self.px(180 if column == "说明" else 80), stretch=column == "说明")
+        self.check_tree.tag_configure("错误", foreground="#A84536", background="#FFF2ED")
+        self.check_tree.tag_configure("提示", foreground="#84612A", background="#FFFBEE")
         self.check_tree.bind("<Double-1>", self._locate_issue)
 
     def _preview_view(self):
@@ -839,33 +892,40 @@ class Application(tk.Tk):
             self._set_preview(str(exc))
 
     def _results_view(self):
-        self.result_hint = self._label(self.result_page, "生成完成后显示结果；右键可查看单元格完整内容。", 9, MUTED)
-        self.result_hint.pack(fill="x", padx=self.px(16), pady=(self.px(10), 0))
+        heading = tk.Frame(self.result_page, bg="white")
+        heading.pack(fill="x", padx=self.px(16), pady=(self.px(8), self.px(4)))
+        self.result_hint = self._label(heading, "生成完成后显示结果", 9, MUTED)
+        self.result_hint.pack(side="left", fill="x", expand=True)
+        self.result_hint.bind("<Configure>", lambda event: self.result_hint.configure(wraplength=event.width))
+        pager = tk.Frame(heading, bg="white")
+        pager.pack(side="right")
         bar = tk.Frame(self.result_page, bg="white")
-        bar.pack(fill="x", padx=self.px(16), pady=self.px(6))
-        self.resume_button = self._button(bar, "继续剩余记录", self.start_continue)
+        bar.pack(fill="x", padx=self.px(16), pady=self.px(3))
+        self.resume_button = self._button(bar, "继续剩余记录", self.start_continue, "Compact.TButton")
         self.resume_button.pack(side="left", padx=(0, 8))
-        self.retry_button = self._button(bar, "重试失败项", self.start_retry)
+        self.retry_button = self._button(bar, "重试失败项", self.start_retry, "Compact.TButton")
         self.retry_button.pack(side="left")
-        self.detail_button = self._button(bar, "查看详情", self.show_result_details)
+        self.detail_button = self._button(bar, "查看详情", self.show_result_details, "Compact.TButton")
         self.detail_button.pack(side="left", padx=8)
-        self._button(bar, "打开输出文件夹", self.open_output).pack(side="right")
+        self.history_button = self._button(bar, "载入历史批次", self.load_history_batch, "Compact.TButton")
+        self.history_button.pack(side="left", padx=(0, 8))
+        self._button(bar, "打开输出文件夹", self.open_output, "Compact.TButton").pack(side="right")
         tools = tk.Frame(self.result_page, bg="white")
-        tools.pack(fill="x", padx=self.px(16), pady=(0, self.px(6)))
+        tools.pack(fill="x", padx=self.px(16), pady=(0, self.px(4)))
         choice = ttk.Combobox(tools, textvariable=self.result_filter, values=("全部结果", "仅失败和部分成功"), state="readonly", width=18)
         choice.pack(side="left")
         choice.bind("<<ComboboxSelected>>", self._filter_results)
         self.controls.append((choice, "readonly"))
-        self.manifest_button = self._button(tools, "打开最新清单", self.open_manifest)
+        self.archive_button = self._button(tools, "打包本批次", self.export_batch_archive, "Compact.TButton")
+        self.archive_button.pack(side="left", padx=8)
+        self.manifest_button = self._button(tools, "打开最新清单", self.open_manifest, "Compact.TButton")
         self.manifest_button.pack(side="right")
-        self.pdf_result_button = self._button(tools, "打开 PDF", lambda: self._open_result(kind="PDF 文件"))
+        self.pdf_result_button = self._button(tools, "打开 PDF", lambda: self._open_result(kind="PDF 文件"), "Compact.TButton")
         self.pdf_result_button.pack(side="right", padx=6)
-        self.word_result_button = self._button(tools, "打开 Word", lambda: self._open_result(kind="Word 文件"))
+        self.word_result_button = self._button(tools, "打开 Word", lambda: self._open_result(kind="Word 文件"), "Compact.TButton")
         self.word_result_button.pack(side="right")
-        pager = tk.Frame(self.result_page, bg="white")
-        pager.pack(fill="x", padx=self.px(16), pady=(0, self.px(8)))
-        self._button(pager, "下一页", lambda: self._change_result_page(1)).pack(side="right")
-        self._button(pager, "上一页", lambda: self._change_result_page(-1)).pack(side="right", padx=6)
+        self._button(pager, "下一页", lambda: self._change_result_page(1), "Compact.TButton").pack(side="right")
+        self._button(pager, "上一页", lambda: self._change_result_page(-1), "Compact.TButton").pack(side="right", padx=6)
         self.result_page_hint = self._label(pager, "每页最多显示 200 条结果", 9, MUTED)
         self.result_page_hint.pack(side="left")
         self.result_tree = self._tree(self.result_page)
@@ -886,6 +946,14 @@ class Application(tk.Tk):
     def _mapping(self):
         return {field: variable.get() for field, variable in self.mapping.items()}
 
+    def _required_fields(self):
+        return tuple(field for field, variable in self.required.items() if variable.get())
+
+    def _required_changed(self):
+        if not self.drawing_mapping:
+            self._show_issues([])
+            self._schedule_save()
+
     def _schedule_save(self):
         if self.drawing_mapping:
             return
@@ -899,7 +967,8 @@ class Application(tk.Tk):
             self.preferences.save(self.output.get(), self.pattern.get(), self.pdf.get(),
                                   self.template.fingerprint if self.template and self.dataset else None,
                                   self._mapping(), recent_file=recent_file, clear_recent=clear_recent,
-                                  animations=self.motion_enabled.get(), task_profile=task_profile, delete_task=delete_task)
+                                  animations=self.motion_enabled.get(), task_profile=task_profile, delete_task=delete_task,
+                                  required_fields=self._required_fields())
             return True
         except OSError as exc:
             self.status.set("无法保存本地设置：" + str(exc))
@@ -950,12 +1019,16 @@ class Application(tk.Tk):
         self._availability(self.page_preview_button, preview_ready and self.converter,
                            pdf_reason if not self.converter else "请先导入模板和数据，并完成字段匹配。")
         retryable = self.last_batch and (any(item["状态"] != "成功" for item in self.last_batch.items)
-                                        or (self.last_batch.manifest_warning and self.last_batch.manifest_path is None))
+                                        or (self.last_batch.manifest_warning and self.last_batch.manifest_path is None)
+                                        or getattr(self.last_batch, "recovery_warning", ""))
         self._availability(self.retry_button, retryable, "当前没有失败项或需要补保存的清单；请先生成文档。")
         resumable = self.last_batch and self.last_batch.remaining_indices
         self._availability(self.resume_button, resumable, "当前批次没有剩余未处理记录；停止后有剩余记录时可继续。")
         manifest = self.last_batch.manifest_path if self.last_batch else None
         self._availability(self.manifest_button, manifest and manifest.is_file(), "当前批次清单尚未保存，或文件已被移动。")
+        has_documents = self.last_batch and any(item.get("Word 文件") or item.get("PDF 文件") for item in self.last_batch.items)
+        self._availability(self.archive_button, has_documents and manifest and manifest.is_file(),
+                           "请先生成文档并保存清单，再打包本批次结果。")
         selected = self.result_tree.selection()
         self._availability(self.detail_button, selected, "请先在结果列表中选择一条记录。")
         item = self.result_items[int(selected[0])] if selected else {}
@@ -1000,6 +1073,8 @@ class Application(tk.Tk):
             content = " · ".join(parts)
         elif self.busy:
             content = "正在处理，请等待当前操作结束。"
+        elif self.last_batch and (not self.template or not self.dataset):
+            content = "历史批次可继续、重试或打包；开始新批次请另选模板和数据。"
         else:
             content = self.ready_reason or "准备就绪，可先预览文件名再生成。"
             if self.last_operation_elapsed is not None:
@@ -1012,13 +1087,14 @@ class Application(tk.Tk):
 
     def _set_busy(self, busy):
         self.busy = busy
+        self.data_tree.configure(selectmode="none" if busy else "extended")
         self._hide_disabled_reason()
         for widget, state in self.controls:
             if widget.winfo_exists():
                 widget.configure(state="disabled" if busy else state)
         self._refresh_ready()
 
-    def _run(self, function, done, label, generation=False):
+    def _run(self, function, done, label, generation=False, cancel_text="停止生成"):
         if self.busy:
             return
         self.progress_motion.cancel()
@@ -1030,7 +1106,7 @@ class Application(tk.Tk):
         self.status.set(label)
         self.cancel_event.clear()
         if generation:
-            self.cancel_button.configure(state="normal")
+            self.cancel_button.configure(state="normal", text=cancel_text)
             self.progressbar.configure(mode="determinate", value=0)
         else:
             self.progressbar.configure(mode="indeterminate")
@@ -1038,6 +1114,10 @@ class Application(tk.Tk):
         def work():
             try:
                 self.events.put(("done", done, function()))
+            except ArchiveCancelled as exc:
+                self.events.put(("cancelled", str(exc)))
+            except CheckCancelled as exc:
+                self.events.put(("check_cancelled", str(exc)))
             except Exception as exc:
                 self.events.put(("error", str(exc), traceback.format_exc()))
         threading.Thread(target=work, daemon=True).start()
@@ -1070,11 +1150,24 @@ class Application(tk.Tk):
                             self.result_tree.insert("", "end", iid=iid, values=values, tags=("odd",) if slot % 2 else ())
                 elif event[0] == "phase":
                     _, self.operation_phase, self.operation_current, self.operation_total = event
+                    if self.operation_phase == "检查数据" and self.operation_total:
+                        self.operation_completed = self.operation_current
+                        self.operation_sample_elapsed = max(0, time.monotonic() - self.operation_started)
+                        self._animate_progress(self.operation_current * 100 / self.operation_total)
+                        self.status.set(f"正在检查 {self.operation_current} / {self.operation_total} 条记录")
+                elif event[0] == "archive_progress":
+                    _, number, total, name = event
+                    self.operation_current = self.operation_completed = number
+                    self.operation_total = total
+                    self.operation_phase = "打包结果"
+                    self.operation_sample_elapsed = max(0, time.monotonic() - self.operation_started)
+                    self._animate_progress(number * 100 / total)
+                    self.status.set(f"正在打包 {number} / {total} · {name}")
                 else:
                     self.progressbar.stop()
                     self.progress_motion.cancel()
                     self.progressbar.configure(mode="determinate")
-                    self.cancel_button.configure(state="disabled")
+                    self.cancel_button.configure(state="disabled", text="停止生成")
                     if self.operation_started is not None:
                         self.last_operation_elapsed = max(0, time.monotonic() - self.operation_started)
                     self.operation_started = None
@@ -1088,6 +1181,10 @@ class Application(tk.Tk):
                         except Exception as exc:
                             self.status.set("操作失败：" + str(exc))
                             messagebox.showerror("操作未完成", str(exc), parent=self)
+                    elif event[0] == "cancelled":
+                        self.status.set("打包已取消，原文件和已有目标文件保留。")
+                    elif event[0] == "check_cancelled":
+                        self._cancel_check()
                     else:
                         self.status.set("操作失败：" + event[1])
                         messagebox.showerror("操作未完成", event[1], parent=self)
@@ -1124,6 +1221,7 @@ class Application(tk.Tk):
         self._check_source_changes()
         self._show_issues([])
         self.mapping = {}
+        self.required = {}
         self.template_label.configure(text=template.path.name)
         self._draw_mapping()
         candidate = next((field for field in template.fields if field in ("姓名", "名称", "客户名称", "编号")), None)
@@ -1222,10 +1320,13 @@ class Application(tk.Tk):
             raise InputError("读取期间源文件发生变化，请保存后重新读取。")
         return template, data
 
-    def _apply_inputs(self, result, mapping, pattern):
+    def _apply_inputs(self, result, mapping, pattern, required_fields=None):
         self._template_loaded(result[0])
         self._data_loaded(result[1])
         self._draw_mapping(choices=mapping)
+        if required_fields is not None:
+            for field, rule in self.required.items():
+                rule.set(field in required_fields)
         self.pattern.set(pattern)
         self._refresh_ready()
         self._update_preview()
@@ -1242,8 +1343,9 @@ class Application(tk.Tk):
             return
         template_path, data_path, sheet = self.template.path, self.data_path, self.dataset.sheet
         mapping, pattern = self._mapping(), self.pattern.get()
+        required_fields = self._required_fields()
         def done(result):
-            self._apply_inputs(result, mapping, pattern)
+            self._apply_inputs(result, mapping, pattern, required_fields)
             if self._save_preferences():
                 self.status.set("已重新读取模板和数据，匹配与导出设置保留；选择、搜索和旧检查已清空，请重新检查。")
         self._run(lambda: self._read_inputs(template_path, data_path, sheet), done, "正在重新读取来源…")
@@ -1262,7 +1364,7 @@ class Application(tk.Tk):
         profile = {"template": str(self.template.path.resolve()), "data": str(self.data_path.resolve()),
                    "sheet": self.dataset.sheet, "mapping": mapping, "pattern": self.pattern.get(),
                    "output": str(Path(self.output.get().strip()).resolve()), "pdf": bool(self.pdf.get()),
-                   "fingerprint": self.template.fingerprint}
+                   "fingerprint": self.template.fingerprint, "required_fields": list(self._required_fields())}
         if self._save_preferences(task_profile=(name, profile)):
             self.status.set(f"已保存任务方案“{name}”；仅保存路径和设置，不保存业务数据或记录选择。")
             return True
@@ -1276,10 +1378,12 @@ class Application(tk.Tk):
         if (not isinstance(profile, dict) or any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in strings)
                 or not isinstance(profile.get("mapping"), dict) or not isinstance(profile.get("pdf"), bool)
                 or any(not isinstance(key, str) or not isinstance(value, str) for key, value in profile["mapping"].items())
-                or any(not Path(profile[key]).is_absolute() for key in ("template", "data", "output"))):
+                or any(not Path(profile[key]).is_absolute() for key in ("template", "data", "output"))
+                or not isinstance(profile.get("required_fields", []), list)
+                or any(not isinstance(field, str) for field in profile.get("required_fields", []))):
             raise InputError("任务方案不存在或内容无效，请重新保存。")
         def done(result):
-            self._apply_inputs(result, profile["mapping"], profile["pattern"])
+            self._apply_inputs(result, profile["mapping"], profile["pattern"], profile.get("required_fields", []))
             self.output.set(profile["output"])
             self.pdf.set(profile["pdf"] and bool(self.converter))
             self.scope.set("全部记录")
@@ -1289,7 +1393,13 @@ class Application(tk.Tk):
                 note += "未检测到 PDF 转换器，本次已关闭 PDF 导出。"
             if self._save_preferences():
                 self.status.set(f"已载入方案“{name}”，重新读取 {len(self.dataset.records)} 条记录，生成范围为全部记录。" + note)
-        self._run(lambda: self._read_inputs(Path(profile["template"]), Path(profile["data"]), profile["sheet"]),
+        def read():
+            result = self._read_inputs(Path(profile["template"]), Path(profile["data"]), profile["sheet"])
+            missing = set(profile.get("required_fields", [])) - set(result[0].fields)
+            if missing:
+                raise InputError("模板已缺少方案指定的必填字段：" + "、".join(sorted(missing)) + "。请重新选择来源并更新方案。")
+            return result
+        self._run(read,
                   done, f"正在载入任务方案“{name}”…")
 
     def open_task_profiles(self):
@@ -1542,7 +1652,7 @@ class Application(tk.Tk):
         self._fill_data()
 
     def _data_selection(self, event=None):
-        if self.filling_data:
+        if self.filling_data or self.busy:
             return
         self._capture_selection()
         selected = self.data_tree.selection()
@@ -1587,7 +1697,7 @@ class Application(tk.Tk):
         start = self.issue_page_number * PAGE_SIZE
         for slot in range(start, min(start + PAGE_SIZE, len(self.issues))):
             issue = self.issues[slot]
-            self.check_tree.insert("", "end", iid=str(slot), values=[self._cell_summary(issue[column]) for column in ("行号", "字段", "数据列", "级别", "说明")])
+            self.check_tree.insert("", "end", iid=str(slot), values=[self._cell_summary(issue[column]) for column in ("行号", "字段", "数据列", "级别", "说明")], tags=(issue["级别"],))
         errors = sum(issue["级别"] == "错误" for issue in self.issues)
         pages = max(1, (len(self.issues) + PAGE_SIZE - 1) // PAGE_SIZE)
         text = f"{errors} 项错误、{len(self.issues)-errors} 项提示 · 第 {self.issue_page_number + 1} / {pages} 页"
@@ -1606,20 +1716,37 @@ class Application(tk.Tk):
         index = self.issues[int(selected[0])]["index"]
         self._locate_data_index(index)
 
+    def _cancel_check(self):
+        self._show_issues([])
+        self.status.set("检查已停止，未生成新文档；请重新检查。")
+
     def check_data(self):
-        if not self.template or not self.dataset:
+        if self.busy or not self.template or not self.dataset:
             self.status.set("请先导入模板和数据并完成字段匹配。")
             return
         if not self._check_source_changes():
             return
         template, dataset, mapping, pattern = self.template, self.dataset, self._mapping(), self.pattern.get()
+        indices = self._generation_indices()
+        if indices == []:
+            self.status.set("请先选择要检查的记录，或改为全部记录。")
+            return
+        required = self._required_fields()
         def done(issues):
+            if self.cancel_event.is_set():
+                self._cancel_check()
+                return
             if not self._check_source_changes():
                 return
             self._show_issues(issues, completed=True)
+            self._animate_progress(100)
             self.notebook.select(self.check_page)
-            self.status.set("检查完成：错误需要先修正；空值按空白填充，重名文件自动编号。")
-        self._run(lambda: check_records(template, dataset, mapping, pattern), done, "正在检查各条记录…")
+            count = len(dataset.records) if indices is None else len(indices)
+            self.status.set(f"已检查当前范围 {count} 条记录：必填空值和错误需修正；普通空值按空白填充，重名自动编号。")
+        self._show_issues([])
+        self._run(lambda: check_records(template, dataset, mapping, pattern, indices, required_fields=required,
+                                       cancel=self.cancel_event, progress=lambda number, total: self._report_phase("检查数据", number, total)),
+                  done, "正在检查当前范围…", generation=True, cancel_text="停止检查")
 
     def export_check_report(self):
         if self.busy or not self.issues or not self.data_path:
@@ -1667,6 +1794,8 @@ class Application(tk.Tk):
             self.output.set(path)
 
     def open_preview(self):
+        if self.busy or not self._check_source_changes():
+            return
         try:
             values = self._preview_values()
             folder = self._new_preview_folder("word-")
@@ -1711,6 +1840,8 @@ class Application(tk.Tk):
         self.preview_cache.cleanup_stale()
 
     def open_page_preview(self):
+        if self.busy or not self._check_source_changes():
+            return
         try:
             values, template = self._preview_values(), self.template
             if not self.converter:
@@ -1746,6 +1877,44 @@ class Application(tk.Tk):
                 self.active_preview_folders.discard(folder)
         self._run(render, done, "正在生成真实页面预览…", generation=True)
 
+    def _generation_indices(self):
+        if self.scope.get() != "选中记录":
+            return None
+        self._capture_selection()
+        return sorted(self.selected_indices)
+
+    def _job_snapshot(self):
+        return (*self.last_job, ()) if len(self.last_job) == 4 else self.last_job
+
+    def _check_batch_revision(self, result):
+        token = getattr(result, "state_token", "")
+        if token and state_token(result.folder) != token:
+            raise InputError("批次已在其他窗口更新，请重新载入历史批次后再操作。")
+        if token and not getattr(result, "recovery_warning", ""):
+            validate_batch_files(result)
+
+    def _execute_batch(self, function, job, previous=None):
+        def execute():
+            if previous is not None:
+                self._check_batch_revision(previous)
+                (previous.folder / ".任务状态未保存").touch()
+            result = function()
+            self._report_phase("保存任务状态", len(result.items), len(result.items) + len(result.remaining_indices))
+            result.recovery_warning = ""
+            try:
+                save_batch_state(result, job)
+            except (OSError, InputError, ValueError) as exc:
+                result.recovery_warning = "任务状态未保存：" + str(exc) + "。已生成文档保留，请修复目录权限后重试。"
+                try:
+                    result.state_token = state_token(result.folder)
+                except OSError:
+                    result.state_token = getattr(previous, "state_token", "") if previous is not None else ""
+            return result
+        if previous is None:
+            return execute()
+        with FileLock(previous.folder / ".批次操作.lock", timeout=0):
+            return execute()
+
     def start_generation(self):
         if self.busy or not self.dataset:
             return
@@ -1756,24 +1925,26 @@ class Application(tk.Tk):
         if not self.output.get().strip():
             messagebox.showerror("缺少输出位置", "请选择输出文件夹。", parent=self)
             return
-        indices = None
-        if self.scope.get() == "选中记录":
-            self._capture_selection()
-            indices = sorted(self.selected_indices)
-            if not indices:
-                messagebox.showinfo("请选择记录", "请先在“数据预览”中选择要生成的记录。", parent=self)
-                self.notebook.select(self.data_page)
-                return
+        indices = self._generation_indices()
+        if indices == []:
+            messagebox.showinfo("请选择记录", "请先在“数据预览”中选择要生成的记录。", parent=self)
+            self.notebook.select(self.data_page)
+            return
+        required = self._required_fields()
         output, pattern, pdf = Path(self.output.get().strip()), self.pattern.get(), self.pdf.get()
         def checked(issues):
+            if self.cancel_event.is_set():
+                self._cancel_check()
+                return
             if not self._check_source_changes():
                 return
             self._show_issues(issues, completed=True)
             if any(issue["级别"] == "错误" for issue in issues):
+                self._animate_progress(100)
                 self.notebook.select(self.check_page)
                 self.status.set("数据检查发现错误，请根据行号和字段修正源文件后重新导入。")
                 return
-            self.last_job = (template, dataset, mapping, pattern)
+            job = self.last_job = (template, dataset, mapping, pattern, required)
             self.last_batch = None
             self.result_items = []
             self.result_page_number = 0
@@ -1783,33 +1954,44 @@ class Application(tk.Tk):
             self.result_hint.configure(text="正在生成，请等待…")
             def progress(number, total, item):
                 self.events.put(("progress", number, total, item, number-1))
-            self._run(lambda: generate_batch(template, dataset, mapping, output, pattern, indices, pdf, self.cancel_event, progress,
-                                            phase=self._report_phase), self._batch_done, "正在准备生成…", generation=True)
+            self._run(lambda: self._execute_batch(
+                lambda: generate_batch(template, dataset, mapping, output, pattern, indices, pdf, self.cancel_event, progress,
+                                       phase=self._report_phase, required_fields=required), job),
+                self._batch_done, "正在准备生成…", generation=True)
         self._save_preferences()
-        self._run(lambda: check_records(template, dataset, mapping, pattern, indices), checked, "生成前正在检查数据…")
+        self._show_issues([])
+        self._run(lambda: check_records(template, dataset, mapping, pattern, indices, required_fields=required,
+                                       cancel=self.cancel_event, progress=lambda number, total: self._report_phase("检查数据", number, total)),
+                  checked, "生成前正在检查数据…", generation=True, cancel_text="停止检查")
 
     def start_retry(self):
         if self.busy or not self.last_batch or not self.last_job:
             return
         previous = self.last_batch
-        template, dataset, mapping, pattern = self.last_job
+        job = self._job_snapshot()
+        template, dataset, mapping, pattern, required = job
         slots = {item["数据行"]: slot for slot, item in enumerate(previous.items)}
         def progress(number, total, item):
             self.events.put(("progress", number, total, item, slots[item["数据行"]]))
         self.notebook.select(self.result_page)
-        self._run(lambda: retry_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress, phase=self._report_phase),
+        self._run(lambda: self._execute_batch(
+            lambda: retry_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
+                                phase=self._report_phase, required_fields=required), job, previous),
                   self._batch_done, "正在重试失败部分…", generation=True)
 
     def start_continue(self):
         if self.busy or not self.last_batch or not self.last_job or not self.last_batch.remaining_indices:
             return
         previous = self.last_batch
-        template, dataset, mapping, pattern = self.last_job
+        job = self._job_snapshot()
+        template, dataset, mapping, pattern, required = job
         initial_count = len(previous.items)
         def progress(number, total, item):
             self.events.put(("progress", number, total, item, initial_count + number - 1))
         self.notebook.select(self.result_page)
-        self._run(lambda: continue_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress, phase=self._report_phase),
+        self._run(lambda: self._execute_batch(
+            lambda: continue_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
+                                   phase=self._report_phase, required_fields=required), job, previous),
                   self._batch_done, f"正在继续剩余 {len(previous.remaining_indices)} 条记录…", generation=True)
 
     def _batch_done(self, result):
@@ -1819,11 +2001,62 @@ class Application(tk.Tk):
         self._fill_results()
         failed = len(result.items) - result.succeeded - result.partial
         text = ("已停止" if result.cancelled else "处理完成") + f"：成功 {result.succeeded}，部分成功 {result.partial}，失败 {failed}，剩余 {len(result.remaining_indices)}。"
-        self.result_hint.configure(text=text)
-        self.status.set(text + (result.manifest_warning or "结果和生成清单已保存，可点击“打开输出文件夹”。"))
+        self.result_hint.configure(text=("已停止" if result.cancelled else "本批次") + f" · 已处理 {len(result.items)} 条 · 剩余 {len(result.remaining_indices)} 条")
+        self.status.set(text + (result.manifest_warning or "文档与清单已保存。"))
+        if getattr(result, "recovery_warning", ""):
+            self.status.set(self.status.get() + " " + result.recovery_warning)
         count = len(result.items) + len(result.remaining_indices)
         self._animate_progress(len(result.items) * 100 / count if count else 0)
         self._refresh_ready()
+
+    def load_history_batch(self, folder=None):
+        if self.busy:
+            return
+        if folder is None:
+            folder = filedialog.askdirectory(parent=self, title="选择原来的批次文件夹", initialdir=self.output.get())
+        if not folder:
+            return
+        folder = Path(folder)
+        def read():
+            with FileLock(folder / ".批次操作.lock", timeout=0):
+                return load_batch_state(folder)
+        def done(loaded):
+            result, job = loaded
+            self.last_job = job
+            self.result_page_number = 0
+            self.result_filter.set("全部结果")
+            self.notebook.select(self.result_page)
+            self._batch_done(result)
+            self.status.set("已载入历史批次，可继续剩余记录或重试失败项；使用原批次快照，当前新任务的来源与设置保留。")
+        self._run(read, done, "正在读取历史批次…")
+
+    def export_batch_archive(self):
+        if self.busy or not self.last_batch:
+            return
+        result = self.last_batch
+        path = filedialog.asksaveasfilename(parent=self, title="打包本批次结果", defaultextension=".zip",
+                                          filetypes=[("ZIP 压缩包", "*.zip")], initialdir=str(result.folder.parent),
+                                          initialfile=result.folder.name + ".zip")
+        if not path:
+            return
+        destination = Path(path)
+        try:
+            sources = [self.template.path if self.template else None, self.data_path]
+            if any(source and (destination.resolve() == source.resolve() or
+                               (destination.exists() and source.exists() and destination.samefile(source))) for source in sources):
+                raise InputError("结果压缩包不能覆盖当前模板或数据，请另选位置。")
+        except (OSError, InputError) as exc:
+            messagebox.showerror("无法打包", str(exc), parent=self)
+            return
+        def work():
+            with FileLock(result.folder / ".批次操作.lock", timeout=0):
+                self._check_batch_revision(result)
+                return archive_batch(result, destination, cancel=self.cancel_event,
+                                     progress=lambda number, total, name: self.events.put(("archive_progress", number, total, name)))
+        def done(saved):
+            self._animate_progress(100)
+            self.status.set(f"已打包本批次的 Word/PDF 和最新清单：{saved}")
+        self._run(work, done, "正在打包本批次…", generation=True, cancel_text="停止打包")
 
     def open_output(self):
         folder = self.last_folder or Path(self.output.get().strip())
@@ -1907,9 +2140,10 @@ class Application(tk.Tk):
         help_text = (
             "1. 准备 Word 模板\n在需要替换的位置写 {{姓名}}、{{部门}} 等占位符，保存为 .docx。支持正文、表格、页眉页脚中的普通文字字段。\n\n"
             "2. 准备 Excel 或 CSV\n第一行填写列标题，每行填写一条记录。支持 .xlsx、UTF-8 / GB18030 CSV。编号的前导零应保存为文本或设置为 000 等数字格式。修改后先保存文件，再点击刷新数据；成功刷新清空旧选择、搜索和检查，保留匹配。最近文件可重新打开已用的模板和数据，也可清空路径记录。\n\n"
-            "3. 检查匹配和预览\n同名字段自动匹配；手动映射会保留供下次使用。可搜索关键词、定位原始数据行号，跨页保留选择，点击清空全部选择可一次取消。搜索只筛选显示；生成范围仍为全部或选中记录。检查问题可双击定位，或导出全部检查结果为 CSV，包含源行号及完整原因。修改匹配、命名或生成范围后请重新检查。查看排版显示真实页面。\n\n"
-            "4. 设置输出并生成\n命名可用 {{序号}} 和模板字段，可先预览前 5 份文件名。主按钮下提示尚缺步骤，灰色操作可悬停查看原因。生成时显示阶段、耗时和剩余时间估算。每次创建独立批次目录和清单。PDF 需要 Word 或 LibreOffice，单份最多等 60 秒。停止后可继续，失败部分可重试。关闭软件后不恢复任务。\n\n"
-            "常用任务与文件变化\n侧栏“任务方案”保存模板/数据路径、工作表、匹配、命名和导出设置，不保存业务数据或记录选择。载入时重新读取源文件，范围重置为全部记录；缺失文件或工作表时保留当前输入。列表路径可右键查看完整内容。源文件保存后发生变化或无法读取时，出现提示栏并阻止新批次生成；点击“重新读取来源”后重新检查。原批次继续和重试保留原数据。\n\n"
+            "3. 检查匹配和预览\n同名字段自动匹配；手动映射和必填规则会保留供下次使用。勾选必填后，空值阻止生成。可搜索关键词、定位原始数据行号、跨页选择和清空选择。搜索只筛选显示；检查与生成均按全部或选中范围执行。手动及生成前检查显示进度，可点击“停止检查”，未完成的报告清空，不生成新文档；重新检查即可。检查问题可双击定位，或导出全部问题为 CSV。修改匹配、必填、命名或范围后请重新检查。查看排版显示真实页面。\n\n"
+            "4. 设置输出并生成\n命名可用 {{序号}} 和模板字段，可先预览前 5 份文件名。灰色操作可悬停查看原因。生成时显示阶段、耗时和剩余时间估算。每次创建独立批次目录和清单。PDF 需要 Word 或 LibreOffice，单份最多等 60 秒。停止后可继续，失败部分可重试。\n\n"
+            "历史批次与分享\n正常完成、停止或关闭后，可在生成结果中“载入历史批次”，选择原批次文件夹，按原模板与数据快照继续或重试。操作前核对结果文件；文件被修改或另一窗口有未保存操作时，请先恢复文件或补存状态。请保留整个批次目录；强制结束或断电不保证恢复未结束操作。“打包本批次”导出 Word/PDF 和最新清单，不包含业务快照；打包可取消，原文件保留。\n\n"
+            "常用任务与文件变化\n侧栏“任务方案”保存来源路径、工作表、匹配、必填、命名和导出设置，不保存业务数据或选择。载入时重新读取源文件，范围重置为全部记录；读取失败保留当前输入。源文件变化时提示并暂停新批次及真实预览；点击“重新读取来源”后重新检查。原批次继续和重试保留原数据。\n\n"
             "注意：不支持 .doc / .xls、图片占位符或循环表格；公式数据需要先在 Excel / WPS 中计算并保存。软件保留模板结构，长文本仍可能使文档重新分页。所有数据在本机处理。"
         )
         box = tk.Frame(window, bg="white", highlightbackground=BORDER, highlightthickness=1)
@@ -2095,6 +2329,148 @@ def verify_check_report(app, folder):
             "source_row_numbers_and_context_correct": True, "report_cleared_after_data_reload": True}
 
 
+def verify_delivery_workflow(app, folder, history=None):
+    from unittest.mock import patch
+    import hashlib
+    import zipfile
+    import threading
+
+    def wait_idle():
+        deadline = time.monotonic() + 120
+        app.update()
+        while app.busy:
+            assert time.monotonic() < deadline, app.status.get()
+            app.update()
+            time.sleep(.01)
+        app.update()
+
+    errors = []
+    with patch.object(messagebox, "showerror", side_effect=lambda *a, **k: errors.append(a)):
+        if history:
+            assert app.template is None and app.dataset is None
+            app.load_history_batch(history)
+            wait_idle()
+            assert app.last_batch and app.last_batch.remaining_indices == [1, 2], errors
+            assert "姓名" in app._job_snapshot()[4]
+            first = app.last_batch.folder / app.last_batch.items[0]["Word 文件"]
+            original = first.read_bytes(), first.stat().st_mtime_ns
+            app.start_continue()
+            wait_idle()
+            assert app.last_batch.succeeded == 3 and not app.last_batch.remaining_indices, errors
+            assert (first.read_bytes(), first.stat().st_mtime_ns) == original
+        else:
+            app.output.set(str(folder / "delivery-output"))
+            app.pdf.set(False)
+            import core as core_module
+            original_values = core_module.values_for
+            previous = app.last_batch
+            existing = set(Path(app.output.get()).glob("批次_*"))
+            for action in (app.check_data, app.start_generation):
+                entered, release = threading.Event(), threading.Event()
+                def blocked_values(*args):
+                    entered.set()
+                    if not release.wait(10):
+                        raise TimeoutError("检查停止验证超时")
+                    return original_values(*args)
+                with patch.object(core_module, "values_for", side_effect=blocked_values):
+                    action()
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not entered.is_set():
+                            assert time.monotonic() < deadline
+                            app.update()
+                            time.sleep(.01)
+                        assert not app.cancel_button.instate(["disabled"])
+                        assert app.cancel_button.cget("text") == "停止检查"
+                        app.cancel_button.invoke()
+                    finally:
+                        release.set()
+                        wait_idle()
+                assert not app.check_completed and not app.issues
+                assert app.last_batch is previous and not errors, errors
+                assert set(Path(app.output.get()).glob("批次_*")) == existing
+            original_check = check_records
+            def late_cancel(*args, **kwargs):
+                issues = original_check(*args, **kwargs)
+                app.cancel_event.set()
+                return issues
+            with patch.object(sys.modules[__name__], "check_records", side_effect=late_cancel):
+                app.start_generation()
+                wait_idle()
+            assert app.last_batch is previous and not app.check_completed and not errors, errors
+            assert set(Path(app.output.get()).glob("批次_*")) == existing
+            app.required["姓名"].set(True)
+            original = app.dataset.records[0]["姓名"]
+            app.dataset.records[0]["姓名"] = ""
+            app.check_data()
+            wait_idle()
+            assert any(issue["级别"] == "错误" for issue in app.issues)
+            app.start_generation()
+            wait_idle()
+            assert app.last_batch is None
+            app.scope.set("选中记录")
+            app.data_tree.selection_set("1")
+            app.update()
+            app.check_data()
+            wait_idle()
+            assert not any(issue["级别"] == "错误" for issue in app.issues)
+            app.dataset.records[0]["姓名"] = original
+            assert app.save_task_profile("发布验证")
+            app.required["姓名"].set(False)
+            app.load_task_profile("发布验证")
+            wait_idle()
+            assert app.required["姓名"].get() and app.scope.get() == "全部记录"
+            stop = threading.Event()
+            job = app.last_job = (app.template, app.dataset, app._mapping(), app.pattern.get(), app._required_fields())
+            app._run(lambda: app._execute_batch(
+                lambda: generate_batch(*job[:3], Path(app.output.get()), job[3], cancel=stop,
+                                       progress=lambda *a: stop.set(), required_fields=job[4]), job),
+                app._batch_done, "正在验证发布功能…", generation=True)
+            wait_idle()
+            assert app.last_batch.succeeded == 1 and app.last_batch.remaining_indices == [1, 2], errors
+        batch = app.last_batch
+        assert not getattr(batch, "recovery_warning", ""), app.status.get()
+        loaded, job = load_batch_state(batch.folder)
+        assert loaded.succeeded == batch.succeeded and "姓名" in job[4]
+        target = folder / "批次分享.zip"
+        with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
+            app.export_batch_archive()
+            wait_idle()
+        expected = {item[key] for item in batch.items for key in ("Word 文件", "PDF 文件") if item[key]}
+        expected.add(batch.manifest_path.name)
+        with zipfile.ZipFile(target) as archive:
+            assert set(archive.namelist()) == expected and archive.testzip() is None
+            assert all(hashlib.sha256(archive.read(name)).digest() == hashlib.sha256((batch.folder / name).read_bytes()).digest()
+                       for name in expected)
+        assert not errors, errors
+        packed = target.read_bytes()
+        document = batch.folder / batch.items[0]["Word 文件"]
+        original = document.read_bytes()
+        try:
+            document.write_bytes(original + b"external change")
+            with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
+                app.export_batch_archive()
+                wait_idle()
+            assert len(errors) == 1 and target.read_bytes() == packed
+        finally:
+            document.write_bytes(original)
+        errors.clear()
+        marker = batch.folder / ".任务状态未保存"
+        marker.touch()
+        try:
+            with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
+                app.export_batch_archive()
+                wait_idle()
+            assert len(errors) == 1 and target.read_bytes() == packed
+        finally:
+            marker.unlink()
+        errors.clear()
+        return {"required_fields_and_scoped_checks": not bool(history), "snapshot_and_zip_verified": True,
+                "changed_results_blocked": True, "foreign_unsaved_state_blocked": True,
+                "manual_and_preflight_checks_stoppable": not bool(history), "late_check_stop_prevents_generation": not bool(history),
+                "fresh_process_resume": bool(history), "history_fixture": str(batch.folder)}
+
+
 def main():
     if "--pdf-worker" in sys.argv:
         from pdf_worker import run_worker
@@ -2112,6 +2488,19 @@ def main():
     # UI smoke testing runs the same callbacks and background workers as a normal session.
     if "--smoke-test" in sys.argv:
         report_path = Path(sys.argv[sys.argv.index("--smoke-test") + 1])
+        if "--smoke-resume" in sys.argv:
+            def resume_smoke():
+                try:
+                    folder = Path(sys.argv[sys.argv.index("--smoke-resume") + 1])
+                    summary = verify_delivery_workflow(app, report_path.parent, folder)
+                    summary["status"] = "PASS"
+                    report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    report_path.write_text(traceback.format_exc(), encoding="utf-8")
+                app._close()
+            app.after(250, resume_smoke)
+            app.mainloop()
+            return
         if peer_root:
             app.withdraw()
             role = report_path.parent.name
@@ -2147,6 +2536,8 @@ def main():
                         summary.update(verify_file_workflow(app, report_path.parent))
                     if "--smoke-report" in sys.argv:
                         summary.update(verify_check_report(app, report_path.parent))
+                    if "--smoke-delivery" in sys.argv:
+                        summary.update(verify_delivery_workflow(app, report_path.parent))
                     if "--smoke-template" in sys.argv:
                         path = Path(sys.argv[sys.argv.index("--smoke-template") + 1])
                         app._template_loaded(Template(path))
@@ -2221,12 +2612,13 @@ def main():
                         app.generate_button.event_generate("<Leave>")
                         summary["disabled_action_reason"] = True
                         app.scope.set("全部记录")
+                        last_folder = app.last_folder
                         preview = app.show_filename_preview()
                         names = preview_filenames(app.template, app.dataset, app._mapping(), app.pattern.get())
                         summary["filename_preview_names"] = [item["Word 文件"] for item in names]
                         content = preview.preview_text.get("1.0", "end-1c")
                         assert all(name in content for name in summary["filename_preview_names"])
-                        assert app.last_folder is None
+                        assert app.last_folder == last_folder
                         preview.destroy()
                         summary["generation_scope_and_count"] = True
                         summary["clear_all_selection"] = True

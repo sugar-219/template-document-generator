@@ -26,10 +26,15 @@ TAG = lambda name: f"{{{W}}}{name}"
 TOKEN = re.compile(r"\{\{\s*([^{}\r\n\t\x00]+?)\s*\}\}")
 PART = re.compile(r"word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$")
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+INVALID_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 class InputError(ValueError):
     """A problem the user can correct in a source file or setting."""
+
+
+class CheckCancelled(RuntimeError):
+    """A stopped check must not be accepted as a complete report."""
 
 
 @dataclass
@@ -117,16 +122,24 @@ def read_data(path: Path, sheet: str | None = None) -> Dataset:
                 continue
         else:
             raise InputError("CSV 编码无法识别，请另存为 UTF-8 CSV。")
+        csv.field_size_limit(max(csv.field_size_limit(), len(text)))
         try:
             dialect = csv.Sniffer().sniff(text[:8192], delimiters=",;\t")
         except csv.Error:
-            dialect = csv.excel
-        return _dataset(csv.reader(io.StringIO(text, newline=""), dialect), "CSV")
+            try:
+                dialect = csv.Sniffer().sniff(re.split(r"[\r\n]", text, maxsplit=1)[0], delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+        try:
+            return _dataset(csv.reader(io.StringIO(text, newline=""), dialect, doublequote=True, strict=True), "CSV")
+        except csv.Error as exc:
+            raise InputError("CSV 格式不正确，请检查引号和分隔符，或重新另存为 CSV：" + str(exc)) from exc
     if path.suffix.lower() != ".xlsx":
         raise InputError("请选择 .xlsx 或 .csv 数据文件。")
     book = load_workbook(path, read_only=True, data_only=False)
-    cached = load_workbook(path, read_only=True, data_only=True)
+    cached = None
     try:
+        cached = load_workbook(path, read_only=True, data_only=True)
         name = sheet or book.sheetnames[0]
         if name not in book.sheetnames:
             raise InputError(f"找不到工作表：{name}")
@@ -141,7 +154,8 @@ def read_data(path: Path, sheet: str | None = None) -> Dataset:
         return _dataset(rows(), name)
     finally:
         book.close()
-        cached.close()
+        if cached is not None:
+            cached.close()
 
 
 def paragraph_nodes(paragraph):
@@ -245,8 +259,8 @@ class Template:
         missing = [field for field in self.fields if field not in values]
         if missing:
             raise InputError("这些模板字段尚未匹配：" + "、".join(missing))
-        if any(re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", value) for value in values.values()):
-            raise InputError("数据包含 Word 不支持的控制字符，请清理后重试。")
+        if any(INVALID_TEXT.search(value) for value in values.values()):
+            raise InputError("数据包含 Word 不支持的控制字符或无效字符，请清理后重试。")
         output = {}
         for name, original in self.roots.items():
             root = copy.deepcopy(original)
@@ -309,16 +323,23 @@ def file_stem(pattern: str, values: dict[str, str], sequence: int) -> str:
     return text
 
 
+def _unique_stem(original, used, suffixes):
+    key = original.casefold()
+    stem, suffix = original, suffixes.get(key, 2)
+    while stem.casefold() in used:
+        stem, suffix = f"{original}_{suffix}", suffix + 1
+    suffixes[key] = suffix
+    used.add(stem.casefold())
+    return stem
+
+
 def preview_filenames(template, dataset, mapping, pattern, indices=None, limit=5):
     indices = range(len(dataset.records)) if indices is None else indices
-    items, used = [], set()
+    items, used, suffixes = [], set(), {}
     for sequence, index in enumerate(indices[:limit], 1):
         values = values_for(template, mapping, dataset.records[index])
         original = file_stem(pattern, values, sequence)
-        stem, suffix = original, 2
-        while stem.casefold() in used:
-            stem, suffix = f"{original}_{suffix}", suffix + 1
-        used.add(stem.casefold())
+        stem = _unique_stem(original, used, suffixes)
         fields = dict.fromkeys(match.group(1).strip() for match in TOKEN.finditer(pattern))
         empty = [name for name in fields if name != "序号" and not values[name].strip()]
         raw = TOKEN.sub(lambda match: {**values, "序号": f"{sequence:03d}"}[match.group(1).strip()], pattern)
@@ -372,23 +393,56 @@ class BatchResult:
         return sum(item["状态"] == "部分成功" for item in self.items)
 
 
-def check_records(template, dataset, mapping, pattern, indices=None):
-    indices = range(len(dataset.records)) if indices is None else indices
-    issues, seen = [], set()
+def _required_fields(template, required_fields):
+    fields = tuple(dict.fromkeys(required_fields))
+    unknown = [name for name in fields if name not in template.fields]
+    if unknown:
+        raise InputError("必填字段不在当前模板中：" + "、".join(unknown))
+    return fields
+
+
+def _require_values(values, required_fields, row_number):
+    empty = [name for name in required_fields if not values[name].strip()]
+    if empty:
+        raise InputError(f"第 {row_number} 行必填字段为空：" + "、".join(empty))
+
+
+def check_records(template, dataset, mapping, pattern, indices=None, *, required_fields=(), cancel=None, progress=None):
+    if cancel is not None and cancel.is_set():
+        raise CheckCancelled("数据检查已停止。")
+    indices = range(len(dataset.records)) if indices is None else list(indices)
+    total = len(indices)
+    required = _required_fields(template, required_fields)
+    issues, seen, suffixes = [], set(), {}
     if any(mapping.get(name) not in dataset.headers for name in template.fields):
         raise InputError("请先完成所有字段匹配。")
+    if progress:
+        progress(0, total)
     for sequence, index in enumerate(indices, 1):
+        if cancel is not None and cancel.is_set():
+            raise CheckCancelled("数据检查已停止。")
+        if index < 0 or index >= len(dataset.records):
+            raise InputError("选择的记录已失效，请重新选择。")
         record = dataset.records[index]
         values = values_for(template, mapping, record)
         for name, value in values.items():
-            reason = "包含 Word 不支持的控制字符" if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", value) else "空值将按空白填充" if not value.strip() else ""
+            if INVALID_TEXT.search(value):
+                reason = "包含 Word 不支持的控制字符或无效字符"
+            elif not value.strip():
+                reason = "必填字段不能为空" if name in required else "空值将按空白填充"
+            else:
+                reason = ""
             if reason:
                 issues.append({"index": index, "行号": dataset.row_numbers[index], "字段": name, "数据列": mapping[name],
-                               "级别": "错误" if "控制字符" in reason else "提示", "说明": reason})
-        stem = file_stem(pattern, values, sequence).casefold()
-        if stem in seen:
+                               "级别": "错误" if "控制字符" in reason or name in required else "提示", "说明": reason})
+        original = file_stem(pattern, values, sequence)
+        if original.casefold() in seen:
             issues.append({"index": index, "行号": dataset.row_numbers[index], "字段": "文件命名", "数据列": "", "级别": "提示", "说明": "文件名重复，将自动添加编号"})
-        seen.add(stem)
+        _unique_stem(original, seen, suffixes)
+        if progress and (sequence % 200 == 0 or sequence == total):
+            progress(sequence, total)
+    if cancel is not None and cancel.is_set():
+        raise CheckCancelled("数据检查已停止。")
     return issues
 
 
@@ -422,12 +476,17 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
                    cancel: threading.Event | None = None,
                    progress: Callable[[int, int, dict[str, str]], None] | None = None,
                    *, previous: BatchResult | None = None,
-                   phase: Callable[[str, int, int], None] | None = None) -> BatchResult:
+                   phase: Callable[[str, int, int], None] | None = None,
+                   required_fields=()) -> BatchResult:
     indices = list(range(len(dataset.records))) if indices is None else list(indices)
     if not indices:
         raise InputError("没有选择要生成的记录。")
     if any(index < 0 or index >= len(dataset.records) for index in indices):
         raise InputError("选择的记录已失效，请重新选择。")
+    required = _required_fields(template, required_fields)
+    if required:
+        for index in indices:
+            _require_values(values_for(template, mapping, dataset.records[index]), required, dataset.row_numbers[index])
     first_values = values_for(template, mapping, dataset.records[indices[0]])
     initial_count = len(previous.items) if previous else 0
     file_stem(pattern, first_values, initial_count + 1)
@@ -451,7 +510,7 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
             if phase:
                 phase("准备转换器", 0, len(indices))
             session = PdfSession(converter, cancel=cancel).__enter__()
-        used = result.used_stems
+        used, suffixes = result.used_stems, {}
         for number, index in enumerate(indices, 1):
             if cancel and cancel.is_set():
                 result.cancelled = True
@@ -460,10 +519,7 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
             try:
                 values = values_for(template, mapping, dataset.records[index])
                 original = file_stem(pattern, values, initial_count + number)
-                stem, suffix = original, 2
-                while stem.casefold() in used:
-                    stem, suffix = f"{original}_{suffix}", suffix + 1
-                used.add(stem.casefold())
+                stem = _unique_stem(original, used, suffixes)
                 destination = folder / f"{stem}.docx"
                 if phase:
                     phase("填充 Word", number, len(indices))
@@ -502,18 +558,31 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
     return result
 
 
-def continue_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None):
+def continue_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None,
+                   required_fields=()):
     if not previous.remaining_indices:
         raise InputError("没有尚未开始的记录；失败部分请使用“重试失败项”。")
     return generate_batch(template, dataset, mapping, previous.folder.parent, pattern,
-                          previous.remaining_indices, previous.export_pdf, cancel, progress, previous=previous, phase=phase)
+                          previous.remaining_indices, previous.export_pdf, cancel, progress, previous=previous,
+                          phase=phase, required_fields=required_fields)
 
 
-def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None):
+def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None,
+                required_fields=()):
     result = BatchResult(previous.folder, [dict(item) for item in previous.items], False,
                          list(previous.indices), previous.export_pdf,
                          remaining_indices=list(previous.remaining_indices), used_stems=set(previous.used_stems))
     slots = [slot for slot, item in enumerate(result.items) if item["状态"] != "成功"]
+    required = _required_fields(template, required_fields)
+    for slot in slots:
+        index = result.indices[slot]
+        if index < 0 or index >= len(dataset.records):
+            raise InputError("选择的记录已失效，请重新选择。")
+        if required:
+            _require_values(values_for(template, mapping, dataset.records[index]), required, dataset.row_numbers[index])
+    occupied = {path.stem.casefold() for path in result.folder.iterdir()
+                if path.suffix.lower() in (".docx", ".pdf")}
+    suffixes = {}
     converter = pdf_converter() if result.export_pdf else None
     session = PdfSession(converter, cancel=cancel) if converter else None
     completed = 0
@@ -527,12 +596,10 @@ def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, prog
                 values = values_for(template, mapping, dataset.records[result.indices[slot]])
                 existing = result.folder / item["Word 文件"] if item["Word 文件"] else None
                 if existing is None or not existing.is_file():
-                    stem = file_stem(pattern, values, slot + 1)
+                    item["Word 文件"] = ""
+                    original = file_stem(pattern, values, slot + 1)
+                    stem = _unique_stem(original, occupied, suffixes)
                     destination = result.folder / f"{stem}.docx"
-                    suffix = 2
-                    while destination.exists():
-                        destination = result.folder / f"{stem}_{suffix}.docx"
-                        suffix += 1
                     if phase:
                         phase("填充 Word", number, len(slots))
                     template.render(values, destination)
@@ -555,6 +622,8 @@ def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, prog
             completed = number
             if progress:
                 progress(number, len(slots), item)
+            if result.cancelled:
+                break
     finally:
         if session:
             session.__exit__(None, None, None)

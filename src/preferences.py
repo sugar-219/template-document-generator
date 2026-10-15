@@ -42,12 +42,13 @@ class Preferences:
                 if isinstance(name, str) and isinstance(profile, dict)} if isinstance(profiles, dict) else {}
 
     def save(self, output, pattern, pdf, fingerprint=None, mapping=None, recent_file=None, clear_recent=False, animations=None,
-             task_profile=None, delete_task=None):
+             task_profile=None, delete_task=None, required_fields=None):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         requested = {"output": output, "pattern": pattern, "pdf": bool(pdf)}
         if animations is not None:
             requested["animations"] = bool(animations)
         mapping = dict(mapping or {})
+        required_fields = sorted(set(required_fields)) if required_fields is not None else None
         missing = object()
         with FileLock(self.path.with_suffix(".lock")):
             data = self._read()
@@ -97,6 +98,8 @@ class Preferences:
                         else:
                             merged.pop(name, None)
                 current["mapping"] = merged
+                if required_fields is not None and previous.get("required_fields", []) != required_fields:
+                    current["required_fields"] = required_fields
                 profiles[fingerprint] = current
                 data["templates"] = profiles
             temporary = None
@@ -115,3 +118,7 @@ class Preferences:
                 if not isinstance(self.local_data.get("templates"), dict):
                     self.local_data["templates"] = {}
                 self.local_data["templates"][fingerprint] = {"pattern": pattern, "mapping": mapping}
+                if required_fields is not None:
+                    self.local_data["templates"][fingerprint]["required_fields"] = required_fields
+                elif "required_fields" in previous:
+                    self.local_data["templates"][fingerprint]["required_fields"] = copy.deepcopy(previous["required_fields"])

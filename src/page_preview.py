@@ -27,7 +27,7 @@ class PagePreview(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.canvas = tk.Canvas(frame, bg="#E3EBF0", highlightthickness=0)
+        self.canvas = tk.Canvas(frame, bg="#E8ECE1", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -60,7 +60,7 @@ class PagePreview(tk.Toplevel):
         self.canvas.delete("all")
         center = max(15, self.canvas.winfo_width() // 2)
         self.canvas.create_rectangle(center - picture.width / 2 + 3, 18, center + picture.width / 2 + 3,
-                                     picture.height + 18, fill="#C5D3DC", outline="")
+                                     picture.height + 18, fill="#CCD5C6", outline="")
         self.canvas.create_image(center, 15, anchor="n", image=self.photo)
         self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), picture.height + 30))
         self.page_label.configure(text=f"第 {self.page_index + 1} / {len(self.document)} 页")

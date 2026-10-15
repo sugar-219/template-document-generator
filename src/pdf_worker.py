@@ -79,14 +79,17 @@ def _office_handle(folder, started):
     """Pin only the newly created Word process reported by this worker."""
     if os.name != "nt":
         return None
+    try:
+        import pywintypes
+        import win32api
+        import win32process
+    except ImportError:
+        return None
     handle = None
     try:
         data = json.loads((folder / "office.json").read_text(encoding="utf-8"))
         if not data.get("owned"):
             return None
-        import pywintypes
-        import win32api
-        import win32process
         handle = win32api.OpenProcess(0x1000 | 0x100000 | 0x1, False, data["pid"])
         created = win32process.GetProcessTimes(handle)["CreationTime"].timestamp()
         buffer = ctypes.create_unicode_buffer(32768)
@@ -97,7 +100,7 @@ def _office_handle(folder, started):
             handle.Close()
             return None
         return handle
-    except (ImportError, OSError, ValueError, KeyError, json.JSONDecodeError):
+    except (OSError, ValueError, KeyError, pywintypes.error):
         if handle is not None:
             handle.Close()
         return None
@@ -116,12 +119,13 @@ def _stop_worker(process, office):
             process.kill()
         process.wait(timeout=5)
     if office is not None:
+        import pywintypes
         import win32api
         import win32event
         try:
             win32api.TerminateProcess(office, 1)
             win32event.WaitForSingleObject(office, 5000)
-        except OSError:
+        except (OSError, pywintypes.error):
             pass
 
 
