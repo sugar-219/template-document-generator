@@ -2,11 +2,14 @@
 import hashlib
 import json
 import zipfile
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
+from version import VERSION
 release = ROOT / "桌面版"
-archive_path = ROOT / "模板文档批量生成软件_v1.14.zip"
+archive_path = ROOT / f"模板文档批量生成软件_v{VERSION}.zip"
 files = sorted(path for path in release.rglob("*") if path.is_file())
 assert (release / "模板文档批量生成.exe").is_file()
 assert (release / "_internal/python313.dll").is_file()

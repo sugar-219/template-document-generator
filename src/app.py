@@ -18,12 +18,15 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from core import CheckCancelled, InputError, Template, check_records, continue_batch, file_stem, generate_batch, pdf_converter, preview_filenames, read_data, retry_batch, sheet_names, values_for
 from check_report import write_check_report
 from batch_state import load_batch_state, save_batch_state, state_token, validate_batch_files
+from batch_journal import BatchJournal
 from motion import Motion
 from local_lock import FileLock
 from pdf_worker import PdfSession
 from preferences import Preferences
 from preview_cache import PreviewCache
 from result_archive import ArchiveCancelled, archive_batch
+from data_search import SearchCancelled, search_records
+from version import VERSION
 
 TITLE = "模板文档批量生成软件"
 BG, INK, MUTED, GREEN, SIDE = "#F5F6F0", "#21372A", "#667862", "#246B45", "#1D3528"
@@ -53,7 +56,7 @@ def source_stamp(path):
 class Application(tk.Tk):
     def __init__(self, settings_path=None):
         super().__init__()
-        self.title(TITLE)
+        self.title(f"{TITLE} v{VERSION}")
         self.configure(bg=BG)
         self.ui_scale = max(1, float(self.tk.call("tk", "scaling")) / (96 / 72))
         self.px = lambda value: round(value * self.ui_scale)
@@ -1118,6 +1121,8 @@ class Application(tk.Tk):
                 self.events.put(("cancelled", str(exc)))
             except CheckCancelled as exc:
                 self.events.put(("check_cancelled", str(exc)))
+            except SearchCancelled as exc:
+                self.events.put(("search_cancelled", str(exc)))
             except Exception as exc:
                 self.events.put(("error", str(exc), traceback.format_exc()))
         threading.Thread(target=work, daemon=True).start()
@@ -1150,11 +1155,12 @@ class Application(tk.Tk):
                             self.result_tree.insert("", "end", iid=iid, values=values, tags=("odd",) if slot % 2 else ())
                 elif event[0] == "phase":
                     _, self.operation_phase, self.operation_current, self.operation_total = event
-                    if self.operation_phase == "检查数据" and self.operation_total:
+                    if self.operation_phase in ("检查数据", "搜索数据") and self.operation_total:
                         self.operation_completed = self.operation_current
                         self.operation_sample_elapsed = max(0, time.monotonic() - self.operation_started)
                         self._animate_progress(self.operation_current * 100 / self.operation_total)
-                        self.status.set(f"正在检查 {self.operation_current} / {self.operation_total} 条记录")
+                        action = "检查" if self.operation_phase == "检查数据" else "搜索"
+                        self.status.set(f"正在{action} {self.operation_current} / {self.operation_total} 条记录")
                 elif event[0] == "archive_progress":
                     _, number, total, name = event
                     self.operation_current = self.operation_completed = number
@@ -1185,6 +1191,9 @@ class Application(tk.Tk):
                         self.status.set("打包已取消，原文件和已有目标文件保留。")
                     elif event[0] == "check_cancelled":
                         self._cancel_check()
+                    elif event[0] == "search_cancelled":
+                        self.data_query.set(self.data_search_text)
+                        self.status.set(event[1])
                     else:
                         self.status.set("操作失败：" + event[1])
                         messagebox.showerror("操作未完成", event[1], parent=self)
@@ -1579,14 +1588,20 @@ class Application(tk.Tk):
         if not self.dataset or self.busy:
             return
         self._capture_selection()
-        self.data_search_text = self.data_query.get().strip().casefold()
-        query = self.data_search_text
-        self.data_indices = [index for index, record in enumerate(self.dataset.records)
-                             if not query or query in str(self.dataset.row_numbers[index])
-                             or any(query in value.casefold() for value in record.values())]
-        self.data_page_number = 0
-        self._fill_data()
-        self.status.set(f"搜索匹配 {len(self.data_indices)} 条。搜索只筛选显示，生成仍按“全部记录”或“选中记录”执行。")
+        query = self.data_query.get().strip().casefold()
+        dataset = self.dataset
+        def done(indices):
+            self.data_search_text = query
+            self.data_indices = indices
+            self.data_page_number = 0
+            self._fill_data()
+            self.status.set(f"搜索匹配 {len(indices)} 条。搜索只筛选显示，生成仍按“全部记录”或“选中记录”执行。")
+        if len(dataset.records) <= 2000 or not query:
+            done(search_records(dataset, query))
+        else:
+            self._run(lambda: search_records(dataset, query, cancel=self.cancel_event,
+                                             progress=lambda current, total: self._report_phase("搜索数据", current, total)),
+                      done, "正在搜索全部数据…", generation=True, cancel_text="停止搜索")
 
     def _clear_data_search(self):
         if self.busy:
@@ -1890,26 +1905,31 @@ class Application(tk.Tk):
         token = getattr(result, "state_token", "")
         if token and state_token(result.folder) != token:
             raise InputError("批次已在其他窗口更新，请重新载入历史批次后再操作。")
-        if token and not getattr(result, "recovery_warning", ""):
+        if token and (not getattr(result, "recovery_warning", "") or getattr(result, "journal_token", "")):
             validate_batch_files(result)
 
     def _execute_batch(self, function, job, previous=None):
         def execute():
             if previous is not None:
                 self._check_batch_revision(previous)
-                (previous.folder / ".任务状态未保存").touch()
-            result = function()
-            self._report_phase("保存任务状态", len(result.items), len(result.items) + len(result.remaining_indices))
-            result.recovery_warning = ""
+            journal = BatchJournal(job, previous)
+            saved = False
             try:
-                save_batch_state(result, job)
-            except (OSError, InputError, ValueError) as exc:
-                result.recovery_warning = "任务状态未保存：" + str(exc) + "。已生成文档保留，请修复目录权限后重试。"
+                result = function(journal)
+                self._report_phase("保存任务状态", len(result.items), len(result.items) + len(result.remaining_indices))
+                result.recovery_warning = ""
                 try:
-                    result.state_token = state_token(result.folder)
-                except OSError:
-                    result.state_token = getattr(previous, "state_token", "") if previous is not None else ""
-            return result
+                    save_batch_state(result, job)
+                    saved = True
+                except (OSError, InputError, ValueError) as exc:
+                    result.recovery_warning = "任务状态未保存：" + str(exc) + "。已生成文档保留，请修复目录权限后重试。"
+                    try:
+                        result.state_token = state_token(result.folder)
+                    except OSError:
+                        result.state_token = getattr(previous, "state_token", "") if previous is not None else ""
+                return result
+            finally:
+                journal.close(saved)
         if previous is None:
             return execute()
         with FileLock(previous.folder / ".批次操作.lock", timeout=0):
@@ -1955,8 +1975,8 @@ class Application(tk.Tk):
             def progress(number, total, item):
                 self.events.put(("progress", number, total, item, number-1))
             self._run(lambda: self._execute_batch(
-                lambda: generate_batch(template, dataset, mapping, output, pattern, indices, pdf, self.cancel_event, progress,
-                                       phase=self._report_phase, required_fields=required), job),
+                lambda checkpoint: generate_batch(template, dataset, mapping, output, pattern, indices, pdf, self.cancel_event, progress,
+                                       phase=self._report_phase, required_fields=required, checkpoint=checkpoint), job),
                 self._batch_done, "正在准备生成…", generation=True)
         self._save_preferences()
         self._show_issues([])
@@ -1975,8 +1995,8 @@ class Application(tk.Tk):
             self.events.put(("progress", number, total, item, slots[item["数据行"]]))
         self.notebook.select(self.result_page)
         self._run(lambda: self._execute_batch(
-            lambda: retry_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
-                                phase=self._report_phase, required_fields=required), job, previous),
+            lambda checkpoint: retry_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
+                                phase=self._report_phase, required_fields=required, checkpoint=checkpoint), job, previous),
                   self._batch_done, "正在重试失败部分…", generation=True)
 
     def start_continue(self):
@@ -1990,8 +2010,8 @@ class Application(tk.Tk):
             self.events.put(("progress", number, total, item, initial_count + number - 1))
         self.notebook.select(self.result_page)
         self._run(lambda: self._execute_batch(
-            lambda: continue_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
-                                   phase=self._report_phase, required_fields=required), job, previous),
+            lambda checkpoint: continue_batch(previous, template, dataset, mapping, pattern, self.cancel_event, progress,
+                                   phase=self._report_phase, required_fields=required, checkpoint=checkpoint), job, previous),
                   self._batch_done, f"正在继续剩余 {len(previous.remaining_indices)} 条记录…", generation=True)
 
     def _batch_done(self, result):
@@ -2005,6 +2025,8 @@ class Application(tk.Tk):
         self.status.set(text + (result.manifest_warning or "文档与清单已保存。"))
         if getattr(result, "recovery_warning", ""):
             self.status.set(self.status.get() + " " + result.recovery_warning)
+        if getattr(result, "progress_warning", ""):
+            self.status.set(self.status.get() + " " + result.progress_warning)
         count = len(result.items) + len(result.remaining_indices)
         self._animate_progress(len(result.items) * 100 / count if count else 0)
         self._refresh_ready()
@@ -2027,7 +2049,7 @@ class Application(tk.Tk):
             self.result_filter.set("全部结果")
             self.notebook.select(self.result_page)
             self._batch_done(result)
-            self.status.set("已载入历史批次，可继续剩余记录或重试失败项；使用原批次快照，当前新任务的来源与设置保留。")
+            self.status.set(getattr(result, "recovery_warning", "") or "已载入历史批次，可继续剩余记录或重试失败项；使用原批次快照，当前新任务的来源与设置保留。")
         self._run(read, done, "正在读取历史批次…")
 
     def export_batch_archive(self):
@@ -2185,292 +2207,6 @@ class Application(tk.Tk):
         self.destroy()
 
 
-def verify_cell_menu(app, tree, row, column):
-    """Exercise a Windows menu and dismiss its native message loop in UI checks."""
-    from ctypes import wintypes
-    class MenuInfo(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
-                    ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND), ("hwndCapture", wintypes.HWND),
-                    ("hwndMenuOwner", wintypes.HWND), ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
-                    ("rcCaret", wintypes.RECT)]
-    api = ctypes.windll.user32
-    thread_id = api.GetWindowThreadProcessId(app.winfo_id(), None)
-    shown = threading.Event()
-    def dismiss():
-        for _ in range(100):
-            info = MenuInfo()
-            info.cbSize = ctypes.sizeof(info)
-            if api.GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndMenuOwner:
-                if api.GetWindowThreadProcessId(info.hwndMenuOwner, None) == thread_id:
-                    shown.set()
-                    api.PostMessageW(info.hwndMenuOwner, 0x0100, 0x1B, 0)
-                    return
-            time.sleep(0.02)
-    x, y, width, height = tree.bbox(row, column)
-    x, y = x + width // 2, y + height // 2
-    helper = threading.Thread(target=dismiss, daemon=True)
-    helper.start()
-    tree.event_generate("<Button-3>", x=x, y=y, rootx=tree.winfo_rootx()+x, rooty=tree.winfo_rooty()+y)
-    helper.join(timeout=3)
-    assert shown.is_set(), "原生右键菜单未显示"
-    assert tree.cell_menu.entrycget(0, "label") == "查看完整内容"
-    tree.cell_menu.invoke(0)
-    return app.cell_window
-
-
-def verify_file_workflow(app, folder):
-    """Verify refreshed input and recent-file actions in source and packaged UI checks."""
-    def wait_idle():
-        deadline = time.monotonic() + 10
-        while app.busy:
-            assert time.monotonic() < deadline, app.status.get()
-            app.update()
-            time.sleep(0.01)
-        app.update()
-    source = folder / "refresh-source.csv"
-    source.write_text(resource("示例文件/人员数据.csv").read_text(encoding="utf-8-sig"), encoding="utf-8-sig")
-    app._data_loaded((source, ["CSV"], read_data(source)))
-    original = app.dataset
-    app.mapping["姓名"].set("部门")
-    app.data_tree.selection_set("0", "1")
-    app.update()
-    source.write_text(source.read_text(encoding="utf-8-sig").replace("林晓", "刷新验收姓名"), encoding="utf-8-sig")
-    app.refresh_button.invoke()
-    wait_idle()
-    assert app.dataset.records[0]["姓名"] == "刷新验收姓名"
-    assert original.records[0]["姓名"] == "林晓"
-    assert app._mapping()["姓名"] == "部门"
-    assert not app.selected_indices and not app.data_tree.selection()
-    assert "已刷新" in app.status.get()
-    window = app.open_recent_files()
-    app.update()
-    data_item = next(iid for iid in window.file_tree.get_children() if window.file_tree.set(iid, "path") == str(source))
-    window.file_tree.selection_set(data_item)
-    app.update()
-    window.open_button.invoke()
-    wait_idle()
-    assert app.data_path == source and app.dataset.records[0]["姓名"] == "刷新验收姓名"
-    window = app.open_recent_files()
-    template_item = next(iid for iid in window.file_tree.get_children() if window.file_tree.set(iid, "kind") == "模板")
-    window.file_tree.selection_set(template_item)
-    app.update()
-    window.open_button.invoke()
-    wait_idle()
-    window = app.open_recent_files()
-    window.clear_button.invoke()
-    assert not window.file_tree.get_children()
-    assert not Preferences(app.preferences.path).recent_files("data")
-    assert not Preferences(app.preferences.path).recent_files("template")
-    assert source.is_file()
-    window.destroy()
-    assert app.save_task_profile("发布验收方案")
-    source.write_text(source.read_text(encoding="utf-8-sig").replace("刷新验收姓名", "方案重新读取姓名"), encoding="utf-8-sig")
-    app._check_source_changes()
-    assert "数据" in app.source_changes and app.generate_button.instate(["disabled"])
-    app.start_generation()
-    assert not app.busy
-    window = app.open_task_profiles()
-    window.profile_tree.selection_set("发布验收方案")
-    app.update()
-    window.load_button.invoke()
-    wait_idle()
-    assert app.dataset.records[0]["姓名"] == "方案重新读取姓名"
-    assert app._mapping()["姓名"] == "部门"
-    assert not app.source_changes and app.scope.get() == "全部记录"
-    window.destroy()
-    source = resource("示例文件/人员数据.xlsx")
-    app._data_loaded((source, sheet_names(source), read_data(source)))
-    app.mapping["姓名"].set("姓名")
-    app._save_preferences()
-    return {"refresh_reads_saved_file_and_keeps_mapping": True, "refresh_clears_old_selection": True,
-            "recent_template_and_data_reopened": True, "recent_history_cleared_without_deleting_files": True,
-            "changed_source_blocks_new_batch": True, "task_profile_load_reads_current_file_and_keeps_mapping": True}
-
-
-def verify_check_report(app, folder):
-    """Export genuine multi-page check results through the desktop controls."""
-    import csv
-    from unittest.mock import patch
-    def wait_idle():
-        deadline = time.monotonic() + 10
-        while app.busy:
-            assert time.monotonic() < deadline, app.status.get()
-            app.update()
-            time.sleep(0.01)
-        app.update()
-    source = folder / "check-source.csv"
-    sample = read_data(resource("示例文件/人员数据.xlsx"))
-    with source.open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=sample.headers)
-        writer.writeheader()
-        for index in range(251):
-            writer.writerow(dict(sample.records[0], 姓名=f"报告验证{index:04d}", 备注=""))
-            writer.writerow({})
-    app._data_loaded((source, ["CSV"], read_data(source)))
-    app.check_data()
-    wait_idle()
-    assert len(app.issues) == 251, app.issues[:3]
-    app._change_issue_page(1)
-    assert len(app.check_tree.get_children()) == 51
-    target = folder / "数据检查报告.csv"
-    with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
-        app.export_report_button.invoke()
-        wait_idle()
-    assert target.read_bytes().startswith(b"\xef\xbb\xbf")
-    with target.open(encoding="utf-8-sig", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-    assert len(rows) == 251 and rows[-1]["行号"] == "502"
-    assert rows[-1]["说明"] == app.issues[-1]["说明"]
-    assert all(row["数据文件"] == str(source) and row["工作表"] == "CSV" for row in rows)
-    source = resource("示例文件/人员数据.xlsx")
-    app._data_loaded((source, sheet_names(source), read_data(source)))
-    assert app.export_report_button.instate(["disabled"])
-    return {"actual_check_report_export": True, "all_251_issues_exported": True,
-            "source_row_numbers_and_context_correct": True, "report_cleared_after_data_reload": True}
-
-
-def verify_delivery_workflow(app, folder, history=None):
-    from unittest.mock import patch
-    import hashlib
-    import zipfile
-    import threading
-
-    def wait_idle():
-        deadline = time.monotonic() + 120
-        app.update()
-        while app.busy:
-            assert time.monotonic() < deadline, app.status.get()
-            app.update()
-            time.sleep(.01)
-        app.update()
-
-    errors = []
-    with patch.object(messagebox, "showerror", side_effect=lambda *a, **k: errors.append(a)):
-        if history:
-            assert app.template is None and app.dataset is None
-            app.load_history_batch(history)
-            wait_idle()
-            assert app.last_batch and app.last_batch.remaining_indices == [1, 2], errors
-            assert "姓名" in app._job_snapshot()[4]
-            first = app.last_batch.folder / app.last_batch.items[0]["Word 文件"]
-            original = first.read_bytes(), first.stat().st_mtime_ns
-            app.start_continue()
-            wait_idle()
-            assert app.last_batch.succeeded == 3 and not app.last_batch.remaining_indices, errors
-            assert (first.read_bytes(), first.stat().st_mtime_ns) == original
-        else:
-            app.output.set(str(folder / "delivery-output"))
-            app.pdf.set(False)
-            import core as core_module
-            original_values = core_module.values_for
-            previous = app.last_batch
-            existing = set(Path(app.output.get()).glob("批次_*"))
-            for action in (app.check_data, app.start_generation):
-                entered, release = threading.Event(), threading.Event()
-                def blocked_values(*args):
-                    entered.set()
-                    if not release.wait(10):
-                        raise TimeoutError("检查停止验证超时")
-                    return original_values(*args)
-                with patch.object(core_module, "values_for", side_effect=blocked_values):
-                    action()
-                    try:
-                        deadline = time.monotonic() + 10
-                        while not entered.is_set():
-                            assert time.monotonic() < deadline
-                            app.update()
-                            time.sleep(.01)
-                        assert not app.cancel_button.instate(["disabled"])
-                        assert app.cancel_button.cget("text") == "停止检查"
-                        app.cancel_button.invoke()
-                    finally:
-                        release.set()
-                        wait_idle()
-                assert not app.check_completed and not app.issues
-                assert app.last_batch is previous and not errors, errors
-                assert set(Path(app.output.get()).glob("批次_*")) == existing
-            original_check = check_records
-            def late_cancel(*args, **kwargs):
-                issues = original_check(*args, **kwargs)
-                app.cancel_event.set()
-                return issues
-            with patch.object(sys.modules[__name__], "check_records", side_effect=late_cancel):
-                app.start_generation()
-                wait_idle()
-            assert app.last_batch is previous and not app.check_completed and not errors, errors
-            assert set(Path(app.output.get()).glob("批次_*")) == existing
-            app.required["姓名"].set(True)
-            original = app.dataset.records[0]["姓名"]
-            app.dataset.records[0]["姓名"] = ""
-            app.check_data()
-            wait_idle()
-            assert any(issue["级别"] == "错误" for issue in app.issues)
-            app.start_generation()
-            wait_idle()
-            assert app.last_batch is None
-            app.scope.set("选中记录")
-            app.data_tree.selection_set("1")
-            app.update()
-            app.check_data()
-            wait_idle()
-            assert not any(issue["级别"] == "错误" for issue in app.issues)
-            app.dataset.records[0]["姓名"] = original
-            assert app.save_task_profile("发布验证")
-            app.required["姓名"].set(False)
-            app.load_task_profile("发布验证")
-            wait_idle()
-            assert app.required["姓名"].get() and app.scope.get() == "全部记录"
-            stop = threading.Event()
-            job = app.last_job = (app.template, app.dataset, app._mapping(), app.pattern.get(), app._required_fields())
-            app._run(lambda: app._execute_batch(
-                lambda: generate_batch(*job[:3], Path(app.output.get()), job[3], cancel=stop,
-                                       progress=lambda *a: stop.set(), required_fields=job[4]), job),
-                app._batch_done, "正在验证发布功能…", generation=True)
-            wait_idle()
-            assert app.last_batch.succeeded == 1 and app.last_batch.remaining_indices == [1, 2], errors
-        batch = app.last_batch
-        assert not getattr(batch, "recovery_warning", ""), app.status.get()
-        loaded, job = load_batch_state(batch.folder)
-        assert loaded.succeeded == batch.succeeded and "姓名" in job[4]
-        target = folder / "批次分享.zip"
-        with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
-            app.export_batch_archive()
-            wait_idle()
-        expected = {item[key] for item in batch.items for key in ("Word 文件", "PDF 文件") if item[key]}
-        expected.add(batch.manifest_path.name)
-        with zipfile.ZipFile(target) as archive:
-            assert set(archive.namelist()) == expected and archive.testzip() is None
-            assert all(hashlib.sha256(archive.read(name)).digest() == hashlib.sha256((batch.folder / name).read_bytes()).digest()
-                       for name in expected)
-        assert not errors, errors
-        packed = target.read_bytes()
-        document = batch.folder / batch.items[0]["Word 文件"]
-        original = document.read_bytes()
-        try:
-            document.write_bytes(original + b"external change")
-            with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
-                app.export_batch_archive()
-                wait_idle()
-            assert len(errors) == 1 and target.read_bytes() == packed
-        finally:
-            document.write_bytes(original)
-        errors.clear()
-        marker = batch.folder / ".任务状态未保存"
-        marker.touch()
-        try:
-            with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):
-                app.export_batch_archive()
-                wait_idle()
-            assert len(errors) == 1 and target.read_bytes() == packed
-        finally:
-            marker.unlink()
-        errors.clear()
-        return {"required_fields_and_scoped_checks": not bool(history), "snapshot_and_zip_verified": True,
-                "changed_results_blocked": True, "foreign_unsaved_state_blocked": True,
-                "manual_and_preflight_checks_stoppable": not bool(history), "late_check_stop_prevents_generation": not bool(history),
-                "fresh_process_resume": bool(history), "history_fixture": str(batch.folder)}
-
-
 def main():
     if "--pdf-worker" in sys.argv:
         from pdf_worker import run_worker
@@ -2482,268 +2218,12 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Local.TemplateBatch.1")
         except (AttributeError, OSError):
             pass
-    report_path = Path(sys.argv[sys.argv.index("--smoke-test") + 1]) if "--smoke-test" in sys.argv else None
-    peer_root = Path(sys.argv[sys.argv.index("--smoke-peer") + 1]) if report_path and "--smoke-peer" in sys.argv else None
-    app = Application(settings_path=peer_root / "preferences.json" if peer_root else report_path.parent / "smoke-settings.json" if report_path else None)
-    # UI smoke testing runs the same callbacks and background workers as a normal session.
     if "--smoke-test" in sys.argv:
-        report_path = Path(sys.argv[sys.argv.index("--smoke-test") + 1])
-        if "--smoke-resume" in sys.argv:
-            def resume_smoke():
-                try:
-                    folder = Path(sys.argv[sys.argv.index("--smoke-resume") + 1])
-                    summary = verify_delivery_workflow(app, report_path.parent, folder)
-                    summary["status"] = "PASS"
-                    report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    report_path.write_text(traceback.format_exc(), encoding="utf-8")
-                app._close()
-            app.after(250, resume_smoke)
-            app.mainloop()
-            return
-        if peer_root:
-            app.withdraw()
-            role = report_path.parent.name
-            assert role in ("a", "b")
-            (peer_root / (role + ".started")).write_text("started")
-            def load_when_both_started():
-                if all((peer_root / (name + ".started")).exists() for name in ("a", "b")):
-                    app.load_demo()
-                else:
-                    app.after(100, load_when_both_started)
-            app.after(250, load_when_both_started)
-        else:
-            app.after(250, app.load_demo)
-        deadline = __import__("time").monotonic() + 120
-        stage = [0]
-        summary = {}
-        if "--smoke-workflow" in sys.argv:
-            summary["worker_phases"] = []
-            report_phase = app._report_phase
-            def capture_phase(phase, current, total):
-                if phase not in summary["worker_phases"]:
-                    summary["worker_phases"].append(phase)
-                report_phase(phase, current, total)
-            app._report_phase = capture_phase
-        def smoke():
-            try:
-                if __import__("time").monotonic() > deadline:
-                    raise TimeoutError("界面测试超时")
-                if app.busy and "已用" in app.action_hint.get():
-                    summary["live_elapsed_display"] = True
-                if stage[0] == 0 and not app.busy and app.dataset:
-                    if "--smoke-files" in sys.argv:
-                        summary.update(verify_file_workflow(app, report_path.parent))
-                    if "--smoke-report" in sys.argv:
-                        summary.update(verify_check_report(app, report_path.parent))
-                    if "--smoke-delivery" in sys.argv:
-                        summary.update(verify_delivery_workflow(app, report_path.parent))
-                    if "--smoke-template" in sys.argv:
-                        path = Path(sys.argv[sys.argv.index("--smoke-template") + 1])
-                        app._template_loaded(Template(path))
-                        summary["template_source"] = str(path)
-                    summary["template_fingerprint"] = app.template.fingerprint
-                    assert not app.generate_button.instate(["disabled"]), app._mapping()
-                    app.notebook.select(app.preview_page)
-                    assert "林晓" in app.preview_text.get("1.0", "end")
-                    app.output.set(str(report_path.parent / "gui-output"))
-                    app.pdf.set("--smoke-pdf" in sys.argv)
-                    if "--smoke-workflow" in sys.argv:
-                        app.nav_buttons[1].invoke()
-                        app.update()
-                        assert app.notebook.select() == str(app.data_page)
-                        assert app.nav_buttons[1].cget("style") == "ActiveNavigation.TButton"
-                        summary["navigation_buttons_and_active_state"] = True
-                        summary["animations_enabled"] = app.nav_motion.enabled
-                        assert app.generate_button.cget("text") == "生成全部 3 份"
-                        geometry, minimum = app.geometry(), app.minsize()
-                        app.minsize(1, 1)
-                        app.geometry(f"{app.winfo_width()}x{app.px(550)}")
-                        app.update()
-                        for page, tree in ((app.data_page, app.data_tree), (app.result_page, app.result_tree)):
-                            app.notebook.select(page)
-                            app.update()
-                            assert tree.winfo_height() >= app.px(34) * 3
-                            assert tree.xview() == (0.0, 1.0)
-                        summary["sample_tables_fit_width"] = True
-                        assert not app.export_panel.winfo_ismapped()
-                        settings = app.open_export_settings()
-                        app.update()
-                        assert settings.winfo_ismapped()
-                        settings.destroy()
-                        app.minsize(*minimum)
-                        app.geometry(geometry)
-                        summary["compact_layout_and_export_settings"] = True
-                        app.notebook.select(app.data_page)
-                        app.update()
-                        tree = app.data_tree
-                        tree.selection_set("0", "1")
-                        app.update()
-                        cell = verify_cell_menu(app, tree, "0", "c6")
-                        content = app.dataset.records[0]["备注"]
-                        assert cell.content_text.get("1.0", "end-1c") == content
-                        assert app.selected_indices == {0, 1}
-                        from unittest.mock import patch
-                        with patch.object(app, "clipboard_clear"), patch.object(app, "clipboard_append") as copied:
-                            cell.copy_button.invoke()
-                            copied.assert_called_once_with(content)
-                        cell.destroy()
-                        app.clear_selection()
-                        summary["native_cell_menu_and_full_copy"] = True
-                        app.data_query.set("陈雨")
-                        app._apply_data_search()
-                        assert app.data_indices == [1]
-                        assert app.scope.get() == "全部记录"
-                        app.locate_row.set("4")
-                        app._locate_row()
-                        assert app.data_query.get() == ""
-                        assert app.preview_index.get() == "3"
-                        app.scope.set("选中记录")
-                        assert app.generate_button.cget("text") == "生成选中 1 份"
-                        app.clear_selection()
-                        assert not app.selected_indices and not app.data_tree.selection()
-                        assert app.generate_button.cget("text") == "生成选中 0 份"
-                        assert app.generate_button.instate(["disabled"])
-                        assert "选择记录" in app.action_hint.get()
-                        app.generate_button.event_generate("<Enter>")
-                        app.update()
-                        assert app.reason_popup is not None
-                        assert "选择记录" in app.reason_popup.reason_text.cget("text")
-                        app.generate_button.event_generate("<Leave>")
-                        summary["disabled_action_reason"] = True
-                        app.scope.set("全部记录")
-                        last_folder = app.last_folder
-                        preview = app.show_filename_preview()
-                        names = preview_filenames(app.template, app.dataset, app._mapping(), app.pattern.get())
-                        summary["filename_preview_names"] = [item["Word 文件"] for item in names]
-                        content = preview.preview_text.get("1.0", "end-1c")
-                        assert all(name in content for name in summary["filename_preview_names"])
-                        assert app.last_folder == last_folder
-                        preview.destroy()
-                        summary["generation_scope_and_count"] = True
-                        summary["clear_all_selection"] = True
-                        summary["search_and_source_row_location"] = True
-                        template, dataset, mapping, pattern = app.template, app.dataset, app._mapping(), app.pattern.get()
-                        output, pdf = Path(app.output.get()), app.pdf.get()
-                        app.last_job = (template, dataset, mapping, pattern)
-                        def stopped_progress(number, total, item):
-                            app.events.put(("progress", number, total, item, number - 1))
-                            if number == 1:
-                                app.cancel_event.set()
-                        app._run(lambda: generate_batch(template, dataset, mapping, output, pattern,
-                                                        export_pdf=pdf, cancel=app.cancel_event, progress=stopped_progress, phase=app._report_phase),
-                                 app._batch_done, "正在验证停止与继续…", generation=True)
-                        stage[0] = 3
-                    else:
-                        app.start_generation()
-                        stage[0] = 1
-                elif stage[0] == 3 and not app.busy and app.last_batch:
-                    assert app.last_batch.succeeded == 1, app.last_batch.items
-                    assert app.last_batch.remaining_indices == [1, 2]
-                    assert not app.resume_button.instate(["disabled"])
-                    original_files = [path for path in app.last_folder.iterdir() if path.suffix in (".docx", ".pdf")]
-                    summary["_original_state"] = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in original_files}
-                    summary["continued_folder"] = str(app.last_folder)
-                    app.start_continue()
-                    stage[0] = 1
-                elif stage[0] == 1 and not app.busy and app.last_folder:
-                    if "--smoke-workflow" in sys.argv:
-                        assert str(app.last_folder) == summary["continued_folder"]
-                        assert app.last_batch.succeeded == 3, app.last_batch.items
-                        assert all("成功" in app.result_tree.item(str(i), "tags") for i in range(3))
-                        colors = {str(app.result_tree.tag_configure(status, "foreground")) for status in ("成功", "部分成功", "失败")}
-                        assert len(colors) == 3 and "" not in colors
-                        summary["result_status_display"] = True
-                        assert not app.last_batch.remaining_indices
-                        assert app.resume_button.instate(["disabled"])
-                        for path, snapshot in summary.pop("_original_state").items():
-                            assert (path.read_bytes(), path.stat().st_mtime_ns) == snapshot
-                        app.result_filter.set("仅失败和部分成功")
-                        app._filter_results()
-                        assert not app.result_tree.get_children()
-                        app.result_filter.set("全部结果")
-                        app._filter_results()
-                        app.result_tree.selection_set("1")
-                        app._refresh_ready()
-                        assert not app.word_result_button.instate(["disabled"])
-                        assert not app.manifest_button.instate(["disabled"])
-                        if app.pdf.get():
-                            assert not app.pdf_result_button.instate(["disabled"])
-                        summary["same_batch_continued_and_success_files_unchanged"] = True
-                        summary["result_filter_and_file_actions"] = True
-                        details = app.show_result_details()
-                        content = details.detail_text.get("1.0", "end-1c")
-                        assert str(app.last_folder / app.result_items[1]["Word 文件"]) in content
-                        assert "数据行：3" in content
-                        from unittest.mock import patch
-                        with patch.object(app, "clipboard_clear"), patch.object(app, "clipboard_append") as copied:
-                            details.copy_button.invoke()
-                            copied.assert_called_once_with(content)
-                        details.destroy()
-                        summary["result_details_and_copy"] = True
-                        assert summary["filename_preview_names"] == [item["Word 文件"] for item in app.result_items]
-                        assert all(phase in summary["worker_phases"] for phase in ("填充 Word", "保存清单"))
-                        if app.pdf.get():
-                            assert "转换 PDF" in summary["worker_phases"]
-                        assert summary["live_elapsed_display"]
-                        assert "上次操作耗时" in app.action_hint.get()
-                        summary["filename_preview_matches_generation"] = True
-                        summary["phase_and_elapsed_feedback"] = True
-                    files = list(app.last_folder.glob("*.docx"))
-                    assert len(files) == 3
-                    pdf_count = len(list(app.last_folder.glob("*.pdf")))
-                    if "--smoke-pdf" in sys.argv:
-                        assert pdf_count == 3, app.status.get()
-                    summary.update(status="PASS", documents=len(files), pdf_documents=pdf_count, folder=str(app.last_folder))
-                    if "--smoke-preview" in sys.argv:
-                        app.open_page_preview()
-                        stage[0] = 2
-                    else:
-                        report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                        app._close()
-                        return
-                elif stage[0] == 2 and not app.busy and app.preview_windows and app.preview_windows[-1].photo:
-                    window = app.preview_windows[-1]
-                    folder = window.folder
-                    summary["preview_pages"] = len(window.document)
-                    if peer_root:
-                        from pdf_worker import write_json
-                        os.utime(folder, (time.time()-60, time.time()-60))
-                        os.utime(app.preview_root, (time.time()-60, time.time()-60))
-                        write_json(peer_root / (role + ".ready.json"), {"folder": str(folder), "instance": str(app.preview_root)})
-                        stage[0] = 4
-                    else:
-                        window.close()
-                        summary["preview_cleaned"] = not folder.exists()
-                        assert summary["preview_cleaned"]
-                        report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                        app._close()
-                        return
-                elif stage[0] == 4 and all((peer_root / (name + ".ready.json")).exists() for name in ("a", "b")):
-                    peer = "b" if role == "a" else "a"
-                    peer_info = json.loads((peer_root / (peer + ".ready.json")).read_text(encoding="utf-8"))
-                    assert peer_info["instance"] != str(app.preview_root)
-                    app._cleanup_previews(schedule=False)
-                    assert (Path(peer_info["folder"]) / "文档预览.docx").is_file()
-                    assert (Path(peer_info["folder"]) / "文档预览.pdf").is_file()
-                    summary["other_process_preview_kept"] = True
-                    (peer_root / (role + ".checked")).write_text("checked")
-                    stage[0] = 5
-                elif stage[0] == 5 and all((peer_root / (name + ".checked")).exists() for name in ("a", "b")):
-                    window = app.preview_windows[-1]
-                    folder = window.folder
-                    window.close()
-                    summary["preview_cleaned"] = not folder.exists()
-                    assert summary["preview_cleaned"]
-                    report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                    app._close()
-                    return
-            except Exception:
-                report_path.write_text(traceback.format_exc(), encoding="utf-8")
-                app._close()
-                return
-            app.after(100, smoke)
-        app.after(400, smoke)
+        sys.path.insert(0, str(app_directory() / "tools"))
+        from smoke_test import run
+        run(sys.modules[__name__])
+        return
+    app = Application()
     app.mainloop()
 
 

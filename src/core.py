@@ -471,13 +471,22 @@ def save_manifest(result):
             pass
 
 
+def _record_checkpoint(checkpoint, result, index, item):
+    if checkpoint:
+        try:
+            checkpoint(result, index, item)
+        except (OSError, InputError) as exc:
+            result.cancelled = True
+            result.progress_warning = "保存进度失败，已停止继续生成：" + str(exc)
+
+
 def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str], output: Path,
                    pattern: str, indices: list[int] | None = None, export_pdf: bool = False,
                    cancel: threading.Event | None = None,
                    progress: Callable[[int, int, dict[str, str]], None] | None = None,
                    *, previous: BatchResult | None = None,
                    phase: Callable[[str, int, int], None] | None = None,
-                   required_fields=()) -> BatchResult:
+                   required_fields=(), checkpoint=None) -> BatchResult:
     indices = list(range(len(dataset.records))) if indices is None else list(indices)
     if not indices:
         raise InputError("没有选择要生成的记录。")
@@ -504,6 +513,8 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
         folder.mkdir()
         result = BatchResult(folder, [], False, [], export_pdf)
     result.remaining_indices = list(indices)
+    if checkpoint:
+        checkpoint(result)
     session = None
     try:
         if converter:
@@ -542,6 +553,7 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
                     result.cancelled = True
             result.items.append(item)
             result.indices.append(index)
+            _record_checkpoint(checkpoint, result, index, item)
             if progress:
                 progress(number, len(indices), item)
             if result.cancelled:
@@ -559,16 +571,16 @@ def generate_batch(template: Template, dataset: Dataset, mapping: dict[str, str]
 
 
 def continue_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None,
-                   required_fields=()):
+                   required_fields=(), checkpoint=None):
     if not previous.remaining_indices:
         raise InputError("没有尚未开始的记录；失败部分请使用“重试失败项”。")
     return generate_batch(template, dataset, mapping, previous.folder.parent, pattern,
                           previous.remaining_indices, previous.export_pdf, cancel, progress, previous=previous,
-                          phase=phase, required_fields=required_fields)
+                          phase=phase, required_fields=required_fields, checkpoint=checkpoint)
 
 
 def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, progress=None, *, phase=None,
-                required_fields=()):
+                required_fields=(), checkpoint=None):
     result = BatchResult(previous.folder, [dict(item) for item in previous.items], False,
                          list(previous.indices), previous.export_pdf,
                          remaining_indices=list(previous.remaining_indices), used_stems=set(previous.used_stems))
@@ -586,6 +598,8 @@ def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, prog
     converter = pdf_converter() if result.export_pdf else None
     session = PdfSession(converter, cancel=cancel) if converter else None
     completed = 0
+    if checkpoint:
+        checkpoint(result)
     try:
         for number, slot in enumerate(slots, 1):
             if cancel and cancel.is_set():
@@ -611,7 +625,14 @@ def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, prog
                         raise InputError("未检测到可用 PDF 转换器。")
                     if phase:
                         phase("转换 PDF", number, len(slots))
-                    item["PDF 文件"] = session.convert(existing).name
+                    target = existing.with_suffix('.pdf')
+                    if target.exists():
+                        # An interrupted conversion may have published an unconfirmed PDF.
+                        stem = _unique_stem(existing.stem, occupied, suffixes)
+                        target = result.folder / (stem + '.pdf')
+                        item["PDF 文件"] = session.convert(existing, destination=target).name
+                    else:
+                        item["PDF 文件"] = session.convert(existing).name
                 item["状态"] = "成功"
                 item["说明"] = "含空值字段" if any(not value.strip() for value in values.values()) else ""
             except Exception as exc:
@@ -620,6 +641,7 @@ def retry_batch(previous, template, dataset, mapping, pattern, cancel=None, prog
                 if isinstance(exc, ConversionCancelled):
                     result.cancelled = True
             completed = number
+            _record_checkpoint(checkpoint, result, result.indices[slot], item)
             if progress:
                 progress(number, len(slots), item)
             if result.cancelled:

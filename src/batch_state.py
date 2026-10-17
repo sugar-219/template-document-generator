@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -76,6 +77,12 @@ def _batch_files(result, folder):
 def validate_batch_files(result):
     folder, private = _folder(result.folder)
     if (folder / DIRTY_FILE).exists():
+        if getattr(result, "journal_token", ""):
+            loaded, _ = load_batch_state(folder)
+            if (loaded.state_token != result.state_token or loaded.journal_token != result.journal_token
+                    or _batch_files(result, folder) != _batch_files(loaded, folder)):
+                raise InputError("恢复进度或结果文件已改变，请重新载入历史批次。")
+            return
         raise InputError("该批次有未保存的操作，请在原窗口重试保存后重新载入。已生成文件保留。")
     encoded = _file(private, STATE_FILE).read_bytes()
     if hashlib.sha256(encoded).hexdigest() != result.state_token:
@@ -131,6 +138,8 @@ def save_batch_state(result, job):
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=private, prefix=".state-", suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
                 json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
             target = _file(private, STATE_FILE)
             temporary.replace(target)
             temporary = created_template = None
@@ -149,8 +158,7 @@ def save_batch_state(result, job):
 
 def load_batch_state(folder):
     folder, private = _folder(folder)
-    if (folder / DIRTY_FILE).exists():
-        raise InputError("该批次上次任务状态未保存，请在原窗口重试保存；已生成文件保留。")
+    interrupted = (folder / DIRTY_FILE).exists()
     path = _file(private, STATE_FILE)
     if not path.is_file():
         raise InputError("未找到可恢复的任务状态，请选择 v1.11 或更新版本完成/停止后的批次文件夹。")
@@ -159,6 +167,9 @@ def load_batch_state(folder):
         data = json.loads(encoded)
         if not isinstance(data, dict) or data.get("schema") != 1:
             raise ValueError("版本无效")
+        if interrupted:
+            from batch_journal import replay_journal
+            data = replay_journal(folder, data, hashlib.sha256(encoded).hexdigest())
         template_path = _file(private, data["template"])
         if (not isinstance(data["template_sha256"], str) or not template_path.is_file()
                 or _digest(template_path) != data["template_sha256"]):
@@ -200,6 +211,10 @@ def load_batch_state(folder):
         if state_token(folder) != hashlib.sha256(encoded).hexdigest():
             raise InputError("读取时批次状态发生变化，请重新载入。")
         result.state_token = hashlib.sha256(encoded).hexdigest()
+        if interrupted:
+            from batch_journal import JOURNAL_FILE
+            result.journal_token = _digest(_file(private, JOURNAL_FILE))
+            result.recovery_warning = "已恢复上次意外中断前确认的进度。请继续剩余记录，或重试失败项以补存清单和任务状态。"
         return result, (template, dataset, mapping, pattern, tuple(required))
     except (KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
         if isinstance(exc, InputError):

@@ -141,9 +141,9 @@ class PdfSession:
     def __enter__(self):
         return self
 
-    def convert(self, docx):
+    def convert(self, docx, destination=None):
         docx = Path(docx).resolve()
-        target = docx.with_suffix(".pdf")
+        target = Path(destination).resolve() if destination is not None else docx.with_suffix(".pdf")
         if target.exists():
             raise FileExistsError(f"PDF 已存在，不会覆盖：{target.name}")
         if self.startup_error:
