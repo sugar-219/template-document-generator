@@ -1,4 +1,5 @@
 .build/
+.venv/
 __pycache__/
 输出文档/
 *.pyc
